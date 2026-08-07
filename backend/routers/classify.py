@@ -3,10 +3,10 @@ backend/routers/classify.py
 POST /classify — rule-based word difficulty classifier.
 Uses wordfreq frequency bands until M3's ML model is ready.
 
-Thresholds:
-  frequency > 1e-4  → Easy
-  1e-5 ≤ freq ≤ 1e-4 → Medium
-  frequency < 1e-5   → Hard
+Thresholds (see backend/services/classifier_service.py):
+  frequency > 1e-4          → Easy
+  1e-6 ≤ freq ≤ 1e-4        → Medium
+  frequency < 1e-6          → Hard
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from wordfreq import word_frequency
 from typing import List
+
+from backend.services.classifier_service import classify_word_label
 
 router = APIRouter(prefix="/classify", tags=["classify"])
 
@@ -42,14 +44,14 @@ def _classify_word(word: str) -> WordClassification:
         return WordClassification(word=word, label="Easy", confidence=0.5)
 
     freq = word_frequency(clean, "en")
+    label = classify_word_label(word)
 
-    if freq > 1e-4:
-        label, confidence = "Easy", min(1.0, freq * 1_000)
-    elif freq >= 1e-6:
-        label, confidence = "Medium", 0.6
+    if label == "Easy":
+        confidence = min(1.0, freq * 1_000)
+    elif label == "Medium":
+        confidence = 0.6
     else:
         confidence = 0.85 if freq == 0 else 0.7
-        label = "Hard"
 
     return WordClassification(word=word, label=label, confidence=round(confidence, 3))
 

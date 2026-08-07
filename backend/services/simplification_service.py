@@ -1,9 +1,14 @@
 import os
+from pathlib import Path
 from groq import Groq
 from fastapi import HTTPException
 from dotenv import load_dotenv
 
-load_dotenv()
+from backend.services.classifier_service import hard_word_pct as count_hard_words
+
+# Explicit path so .env loads regardless of the process's working directory
+# (this module can be imported standalone, e.g. in tests, without main.py running first)
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # Load Groq client once at module level
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -21,14 +26,6 @@ Rewrite the following text following these strict rules:
 
 Text to rewrite:
 """
-
-def count_hard_words(text: str) -> float:
-    """Returns percentage of words with 3+ syllables (rough hard word metric)"""
-    words = text.split()
-    if not words:
-        return 0.0
-    hard = sum(1 for w in words if len(w) > 8)
-    return round((hard / len(words)) * 100, 1)
 
 def flesch_kincaid_grade(text: str) -> float:
     """Calculate Flesch-Kincaid grade level"""

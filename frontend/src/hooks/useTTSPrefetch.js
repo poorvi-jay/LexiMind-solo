@@ -1,7 +1,10 @@
 import { useCallback, useRef } from 'react'
 
-const BASE_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8001'
-const DEFAULT_VOICE = 'en-US-AriaNeural'
+import { BASE_URL } from '../utils/api'
+
+// Must match the voice used for real playback (useTTSPlayer.js / ReadingPage.jsx),
+// otherwise a cache hit would silently play back in the wrong voice.
+const DEFAULT_VOICE = 'en-GB-SoniaNeural'
 
 /**
  * Pre-fetches TTS audio in the background so playback is instant.

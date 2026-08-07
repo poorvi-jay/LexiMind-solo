@@ -1,9 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# Explicit path so .env loads regardless of the process's working directory
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 app = FastAPI(title="LexiMind AI API", version="5.0")
 
@@ -24,6 +26,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Word-Timings", "X-Duration-Ms"],
 )
 
 from backend.routers.ocr import router as ocr_router
