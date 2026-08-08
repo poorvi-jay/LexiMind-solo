@@ -103,6 +103,31 @@ export function useTTSPlayer(onWordChange) {
   }, [])
 
   /* ══════════════════════════════════════════════
+     RELEASE — tear down the current element safely
+     ══════════════════════════════════════════════ */
+  const releaseAudio = useCallback(() => {
+    const audio = audioRef.current
+    if (!audio) return
+
+    // Detach the handlers first. Revoking a blob URL while the element still
+    // points at it makes the element fire `error`, and a stale handler would
+    // then tear down whatever playback has started in the meantime — flipping
+    // the UI back to "Play" and killing the new highlight loop mid-sentence.
+    audio.onended = null
+    audio.onerror = null
+    audio.onstalled = null
+
+    audio.pause()
+
+    const src = audio.src
+    audio.removeAttribute('src')
+    audio.load() // resets the element so it lets go of the blob
+    if (src) URL.revokeObjectURL(src)
+
+    audioRef.current = null
+  }, [])
+
+  /* ══════════════════════════════════════════════
      PLAY — fixed: no double src assignment
      ══════════════════════════════════════════════ */
   const play = useCallback(async (text, speed = 1.0, phrasePauses = true, prefetched = null, baseIndex = 0) => {
@@ -114,11 +139,7 @@ export function useTTSPlayer(onWordChange) {
 
       
 
-      if (audioRef.current) {
-        audioRef.current.pause()
-        if (audioRef.current.src) URL.revokeObjectURL(audioRef.current.src)
-        audioRef.current = null
-      }
+      releaseAudio()
 
       let blob, wordTimings, durationMs
 
@@ -193,7 +214,10 @@ export function useTTSPlayer(onWordChange) {
 
       computeScale()
 
+      // Both handlers bail out if this element has since been replaced, so a
+      // late event from a superseded playback can't disturb the current one.
       audio.onended = () => {
+        if (audioRef.current !== audio) return
         console.log('[TTS] audio ended naturally')
         stopSync()
         wordIndexRef.current = -1
@@ -205,6 +229,7 @@ export function useTTSPlayer(onWordChange) {
       }
 
       audio.onerror = (e) => {
+        if (audioRef.current !== audio) return
         console.error('[TTS] audio error:', e)
         stopSync()
         setError('Audio playback failed')
@@ -232,7 +257,7 @@ export function useTTSPlayer(onWordChange) {
       setIsLoading(false)
       setIsPlaying(false)
     }
-  }, [stopSync, startSync, computeScale, onWordChange])
+  }, [stopSync, startSync, computeScale, onWordChange, releaseAudio])
 
   /* ══════════════════════════════════════════════
      PAUSE / RESUME / STOP
@@ -258,12 +283,7 @@ export function useTTSPlayer(onWordChange) {
 
   const stop = useCallback(() => {
     stopSync()
-    if (audioRef.current) {
-      audioRef.current.pause()
-      audioRef.current.currentTime = 0
-      if (audioRef.current.src) URL.revokeObjectURL(audioRef.current.src)
-      audioRef.current = null
-    }
+    releaseAudio()
     timingsRef.current   = []
     wordIndexRef.current = -1
     baseIndexRef.current = 0
@@ -272,7 +292,7 @@ export function useTTSPlayer(onWordChange) {
     setIsPaused(false)
     setTotalDurationMs(0)
     onWordChange(-1)
-  }, [stopSync, onWordChange])
+  }, [stopSync, onWordChange, releaseAudio])
 
   /* ══════════════════════════════════════════════
      PLAY SINGLE WORD
@@ -294,10 +314,21 @@ export function useTTSPlayer(onWordChange) {
   }, [])
 
   const getCurrentWordIndex = useCallback(() => {
-    return wordIndexRef.current >= 0
-      ? baseIndexRef.current + wordIndexRef.current
-      : -1
-  }, [])
+    if (wordIndexRef.current >= 0) {
+      return baseIndexRef.current + wordIndexRef.current
+    }
+
+    // The rAF sync loop may not have ticked yet. Derive the position from the
+    // audio clock instead, so callers never mistake "not tracked yet" for
+    // "at the very beginning" and rewind the whole passage.
+    const audio   = audioRef.current
+    const timings = timingsRef.current
+    if (!audio || !timings.length) return -1
+
+    const scale = scaleRef.current > 0 ? scaleRef.current : 1
+    const index = findWordIndex(timings, (audio.currentTime * 1000) / scale)
+    return index >= 0 ? baseIndexRef.current + index : -1
+  }, [findWordIndex])
 
   return {
     play, pause, resume, stop, playWord, getCurrentWordIndex,

@@ -258,7 +258,12 @@ export default function ReadingPage() {
 
     if (!isPlaying) return
 
-    const currentIndex = Math.max(getCurrentWordIndex(), activeIndex, 0)
+    // Only resume from a position we actually know. Falling back to 0 here
+    // meant an untracked position replayed the entire passage from the top —
+    // which reads as "it started over" a few lines in.
+    const currentIndex = Math.max(getCurrentWordIndex(), activeIndex)
+    if (currentIndex < 0) return
+
     const sourceWords = showWords.length > 0 ? showWords : words
     const remainingText = sourceWords.slice(currentIndex).join(' ')
 
