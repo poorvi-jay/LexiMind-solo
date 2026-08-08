@@ -36,6 +36,8 @@ export default function ReadingPage() {
   const [isUploading, setIsUploading]     = useState(false)
   const [distractionFree, setDistraction] = useState(false)
   const [classificationReady, setClassificationReady] = useState(false)
+  // True while handlePlay is generating audio, before play() takes over isLoading.
+  const [isPreparing, setIsPreparing] = useState(false)
 
   // Store the raw word_timings so we can use backend's word list
   const [wordTimings, setWordTimings]     = useState([])
@@ -64,8 +66,14 @@ export default function ReadingPage() {
   }, [distractionFree])
 
   useEffect(() => {
+    // Skip while audio is active or being generated. Changing speed mid-playback
+    // re-runs this, and regenerating the whole passage is wasted work when
+    // handleSpeedChange only needs the remaining words. isPreparing matters
+    // because that handler calls stop() first, which clears isPlaying before
+    // this effect gets a chance to run. Prefetching resumes once playback ends.
+    if (isPlaying || isPaused || isPreparing) return
     if (text.trim()) prefetch(text.trim(), speed, prefs.phrasePauses)
-  }, [text, speed, prefs.phrasePauses, prefetch])
+  }, [text, speed, prefs.phrasePauses, prefetch, isPlaying, isPaused, isPreparing])
 
   /* ── FIX #3: When TTS data arrives, rebuild words from timings ── */
   const displayWords = useMemo(() => {
@@ -197,6 +205,8 @@ export default function ReadingPage() {
 
   /* ── Play — also capture word_timings for display sync ── */
   async function handlePlay() {
+    if (isPreparing) return // a generation is already running
+
     const trimmed = text.trim()
     const cached = getCached(trimmed, speed, prefs.phrasePauses)
 
@@ -204,42 +214,48 @@ export default function ReadingPage() {
     if (cached?.word_timings) {
       setWordTimings(cached.word_timings)
       console.log(`[ReadingPage] Using ${cached.word_timings.length} cached timing words`)
-    } else {
-      // If not cached, we'll get timings from the API response
-      // The play function handles this internally, but we also need them
-      try {
-        const data = await api.post('/tts/generate', {
-          text: trimmed,
-          speed,
-          voice: 'en-GB-SoniaNeural',
-          phrase_pauses: prefs.phrasePauses,
-        })
-
-        const binary = atob(data.audio_b64)
-        const bytes  = new Uint8Array(binary.length)
-        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-        const blob = new Blob([bytes], { type: 'audio/mpeg' })
-
-        const prefetchedData = {
-          blob,
-          word_timings: data.word_timings,
-          duration_ms: data.duration_ms || 0,
-        }
-
-        if (data.word_timings) {
-          setWordTimings(data.word_timings)
-          console.log(`[ReadingPage] Using ${data.word_timings.length} fresh timing words`)
-        }
-
-        play(trimmed, speed, prefs.phrasePauses, prefetchedData)
-        return
-      } catch (err) {
-        showToast(err.message, 'error')
-        return
-      }
+      play(trimmed, speed, prefs.phrasePauses, cached)
+      return
     }
 
-    play(trimmed, speed, prefs.phrasePauses, cached)
+    // Nothing prefetched yet, so generate now. On a long passage this takes
+    // several seconds, and play() — which owns isLoading — isn't reached until
+    // it resolves. Without a loading state of its own the Play button stays
+    // live the whole time, and a second click starts a rival playback that
+    // yanks the audio back to the beginning mid-sentence.
+    setIsPreparing(true)
+    try {
+      const data = await api.post('/tts/generate', {
+        text: trimmed,
+        speed,
+        voice: 'en-GB-SoniaNeural',
+        phrase_pauses: prefs.phrasePauses,
+      })
+
+      const binary = atob(data.audio_b64)
+      const bytes  = new Uint8Array(binary.length)
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+      const blob = new Blob([bytes], { type: 'audio/mpeg' })
+
+      const prefetchedData = {
+        blob,
+        word_timings: data.word_timings,
+        duration_ms: data.duration_ms || 0,
+      }
+
+      if (data.word_timings) {
+        setWordTimings(data.word_timings)
+        console.log(`[ReadingPage] Using ${data.word_timings.length} fresh timing words`)
+      }
+
+      // play() sets isLoading synchronously, so the button stays disabled
+      // without a gap when isPreparing clears below.
+      play(trimmed, speed, prefs.phrasePauses, prefetchedData)
+    } catch (err) {
+      showToast(err.message, 'error')
+    } finally {
+      setIsPreparing(false)
+    }
   }
 
   function handlePauseResume() {
@@ -269,9 +285,17 @@ export default function ReadingPage() {
 
     if (!remainingText.trim()) return
 
-    stop()
-    setWordTimings([])
-    await play(remainingText, nextSpeed, prefs.phrasePauses, null, currentIndex)
+    // Marked as preparing for the same reasons as handlePlay: it keeps the
+    // Play button — which stop() briefly brings back — from starting a rival
+    // playback, and it stops the prefetch effect regenerating the whole passage.
+    setIsPreparing(true)
+    try {
+      stop()
+      setWordTimings([])
+      await play(remainingText, nextSpeed, prefs.phrasePauses, null, currentIndex)
+    } finally {
+      setIsPreparing(false)
+    }
   }
 
   const hasText = displayWords.length > 0 || words.length > 0
@@ -547,12 +571,12 @@ export default function ReadingPage() {
               <button
                 type="button"
                 onClick={handlePlay}
-                disabled={isLoading}
+                disabled={isLoading || isPreparing}
                 className="rounded-xl bg-blue-600 px-6 py-2.5 text-sm font-bold
                             text-white shadow-md shadow-blue-200 hover:bg-blue-700
                             disabled:opacity-50 dark:shadow-none"
               >
-                {isLoading ? 'Loading…' : '▶  Play'}
+                {isLoading || isPreparing ? 'Loading…' : '▶  Play'}
               </button>
             ) : (
               <button
