@@ -1,6 +1,6 @@
 import { useCallback, useRef } from 'react'
 
-import { BASE_URL } from '../utils/api'
+import { BASE_URL, getToken } from '../utils/api'
 
 // Must match the voice used for real playback (useTTSPlayer.js / ReadingPage.jsx),
 // otherwise a cache hit would silently play back in the wrong voice.
@@ -26,11 +26,18 @@ export function useTTSPrefetch() {
       phrase_pauses: phrasePauses,
     })
 
+    // These two calls use raw fetch (the fast endpoint returns binary, not
+    // JSON), so they have to attach the bearer token themselves — api.js
+    // isn't in the path to do it for them.
+    const headers = { 'Content-Type': 'application/json' }
+    const token = getToken()
+    if (token) headers.Authorization = `Bearer ${token}`
+
     // Try binary endpoint first
     try {
       const res = await fetch(`${BASE_URL}/tts/generate-fast`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body,
       })
 
@@ -54,7 +61,7 @@ export function useTTSPrefetch() {
     // Fallback — JSON endpoint
     const res = await fetch(`${BASE_URL}/tts/generate`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body,
     })
 

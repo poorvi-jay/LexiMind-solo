@@ -39,10 +39,12 @@ app.add_middleware(
     expose_headers=["X-Word-Timings", "X-Duration-Ms"],
 )
 
+from backend.routers.auth import router as auth_router
 from backend.routers.ocr import router as ocr_router
 from backend.routers.tts import router as tts_router
 from backend.routers.reading import router as reading_router
 from backend.routers.classify import router as classify_router  # import the classify router
+app.include_router(auth_router, tags=["Auth"])
 app.include_router(ocr_router, tags=["OCR"])
 app.include_router(tts_router, tags=["TTS"])
 app.include_router(reading_router, tags=["Reading"])

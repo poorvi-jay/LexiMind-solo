@@ -2,12 +2,11 @@ import json
 
 from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel
+from backend.dependencies import get_current_user
+from backend.models import User
 from backend.services import tts_service
 
 router = APIRouter()
-
-def get_current_user():
-    return {"id": "dev-user"}
 
 class TTSRequest(BaseModel):
     text: str
@@ -22,7 +21,7 @@ class WordTTSRequest(BaseModel):
 @router.post("/tts/generate")
 async def tts_generate(
     req: TTSRequest,
-    current_user: dict = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     return await tts_service.generate_tts(
         text=req.text,
@@ -34,7 +33,7 @@ async def tts_generate(
 @router.post("/tts/word")
 async def tts_word(
     req: WordTTSRequest,
-    current_user: dict = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     return await tts_service.generate_word_tts(req.word, req.voice)
 
@@ -42,7 +41,7 @@ async def tts_word(
 @router.post("/tts/generate-fast")
 async def tts_generate_fast(
     req: TTSRequest,
-    current_user: dict = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     """
     Binary variant of /tts/generate for prefetching — returns raw audio bytes

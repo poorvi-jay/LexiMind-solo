@@ -1,4 +1,7 @@
-import { Link, useLocation } from 'react-router-dom'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
+
+import { startTransition } from 'react'
+import { useAuthContext } from '../context/AuthContext.jsx'
 
 const links = [
   { to: '/', label: 'Home' },
@@ -8,6 +11,20 @@ const links = [
 
 export default function NavBar() {
   const { pathname } = useLocation()
+  const { isAuthenticated, user, logout } = useAuthContext()
+  const navigate = useNavigate()
+
+  // Home is public, so it's the natural place to land after logging out.
+  // Both updates go in one transition: the router runs navigation as a
+  // transition (v7_startTransition in main.jsx), so an urgent logout() would
+  // otherwise commit first and let the current page's guard bounce the user
+  // to /auth before the navigation home lands.
+  const handleLogout = () => {
+    startTransition(() => {
+      logout()
+      navigate('/', { replace: true })
+    })
+  }
 
   return (
     <nav
@@ -44,6 +61,8 @@ export default function NavBar() {
         </Link>
 
         {/* ── Tab group ── */}
+        {/* Always visible. Reading and Settings are auth-gated, so a logged-out
+            visitor who picks one is sent to /auth and returned there afterwards. */}
         <div
           className="flex rounded-full border border-gray-200 bg-gray-50 p-1
                       dark:border-gray-800 dark:bg-[#2A2A2A]"
@@ -72,6 +91,40 @@ export default function NavBar() {
               </Link>
             )
           })}
+        </div>
+
+        {/* ── Auth state ── */}
+        <div className="flex items-center gap-3">
+          {isAuthenticated ? (
+            <>
+              <span className="hidden text-sm text-gray-500 dark:text-gray-400 sm:block">
+                {user?.name}
+              </span>
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="rounded-full border border-gray-200 px-4 py-2 text-sm font-medium
+                           text-gray-600 transition-colors hover:text-gray-900
+                           focus-visible:outline-2 focus-visible:outline-offset-2
+                           focus-visible:outline-blue-500
+                           dark:border-gray-800 dark:text-gray-300 dark:hover:text-white"
+              >
+                Log out
+              </button>
+            </>
+          ) : (
+            pathname !== '/auth' && (
+              <Link
+                to="/auth"
+                className="rounded-full bg-blue-600 px-4 py-2 text-sm font-semibold text-white
+                           transition-colors hover:bg-blue-700
+                           focus-visible:outline-2 focus-visible:outline-offset-2
+                           focus-visible:outline-blue-500"
+              >
+                Log in
+              </Link>
+            )
+          )}
         </div>
       </div>
     </nav>

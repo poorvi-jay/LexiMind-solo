@@ -8,6 +8,8 @@ Also enriches /reading/define response with all meanings + syllable_count.
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from backend.dependencies import get_current_user
+from backend.models import User
 from backend.services import simplification_service
 import httpx
 import re
@@ -24,10 +26,6 @@ except LookupError:
 
 
 router = APIRouter()
-
-
-def get_current_user():
-    return {"id": "dev-user"}
 
 
 class SimplifyRequest(BaseModel):
@@ -77,7 +75,7 @@ def count_syllables(word: str) -> int:
 @router.post("/reading/simplify")
 async def simplify(
     req: SimplifyRequest,
-    current_user: dict = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     if not req.text.strip():
         raise HTTPException(400, "No text provided.")
@@ -87,7 +85,7 @@ async def simplify(
 @router.post("/reading/complexity")
 async def complexity(
     req: ComplexityRequest,
-    current_user: dict = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     if not req.text.strip():
         raise HTTPException(400, "No text provided.")
@@ -97,7 +95,7 @@ async def complexity(
 @router.post("/reading/define")
 async def define_word(
     req: DefineRequest,
-    current_user: dict = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
     word = req.word.strip().lower()
     if not word:
