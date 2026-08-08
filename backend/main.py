@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -7,7 +8,16 @@ from dotenv import load_dotenv
 # Explicit path so .env loads regardless of the process's working directory
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-app = FastAPI(title="LexiMind AI API", version="5.0")
+from backend.database import init_db
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()  # create any missing tables (no Alembic — SQLite + create_all)
+    yield
+
+
+app = FastAPI(title="LexiMind AI API", version="5.0", lifespan=lifespan)
 
 configured_origins = [
     origin.strip()
