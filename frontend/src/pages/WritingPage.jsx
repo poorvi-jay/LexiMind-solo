@@ -1,0 +1,248 @@
+import { useCallback, useEffect, useMemo, useState } from 'react'
+
+import { api } from '../utils/api'
+import { useAutosave } from '../hooks/useAutosave'
+import { usePrefs } from '../context/PreferencesContext'
+
+/** Matches MAX_CONTENT_CHARS in backend/routers/writing.py. */
+const MAX_CONTENT_CHARS = 50_000
+const MAX_TITLE_CHARS = 150
+/** Matches DEFAULT_TITLE in backend/routers/writing.py. */
+const DEFAULT_TITLE = 'Untitled'
+
+// The load is what arms autosave, so a failure has to be recoverable without a
+// page reload. Retry on our own first — the backend is often just still booting
+// — then fall back to a button the user drives.
+const AUTO_LOAD_RETRIES = 2
+const RETRY_BACKOFF_MS = 2000
+
+function countWords(text) {
+  const trimmed = text.trim()
+  return trimmed ? trimmed.split(/\s+/).length : 0
+}
+
+function formatTime(date) {
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+}
+
+/**
+ * F25 writing notepad · F31 autosave.
+ *
+ * The document loads before autosave is armed, so an empty textarea can never
+ * overwrite saved text. Typography comes from the shared reading preferences,
+ * so the notepad matches the reading workspace.
+ */
+export default function WritingPage() {
+  const { prefs } = usePrefs()
+
+  const [title, setTitle] = useState(DEFAULT_TITLE)
+  const [content, setContent] = useState('')
+  // 'loading' → still fetching (including automatic retries)
+  // 'ready'   → baseline known, autosave armed
+  // 'failed'  → out of automatic retries, waiting on the user
+  const [loadState, setLoadState] = useState('loading')
+  const [attempt, setAttempt] = useState(0)
+
+  const ready = loadState === 'ready'
+
+  const { dirty, saving, error, lastSavedAt, saveNow, adoptDocument } = useAutosave({
+    title,
+    content,
+    enabled: ready,
+  })
+
+  /* ── Restore the last saved draft ── */
+  // adoptDocument is stable, so this refetches only when a retry bumps
+  // `attempt` — never on its own after a successful load.
+  useEffect(() => {
+    let cancelled = false
+    let retryTimer = null
+
+    api
+      .get('/writing/autosave')
+      .then(({ document: doc }) => {
+        if (cancelled) return
+        if (doc) {
+          setTitle(doc.title)
+          setContent(doc.content)
+        }
+        // With nothing saved yet the baseline is the blank page as rendered,
+        // otherwise the default title alone would read as an unsaved change.
+        adoptDocument(doc ?? { id: null, title: DEFAULT_TITLE, content: '' })
+        setLoadState('ready')
+      })
+      .catch(() => {
+        if (cancelled) return
+        // Autosave stays disarmed either way: without knowing what the server
+        // holds, a save would push this empty page over whatever is stored.
+        if (attempt < AUTO_LOAD_RETRIES) {
+          retryTimer = setTimeout(
+            () => setAttempt(n => n + 1),
+            RETRY_BACKOFF_MS * (attempt + 1)
+          )
+        } else {
+          setLoadState('failed')
+        }
+      })
+
+    return () => {
+      cancelled = true
+      if (retryTimer) clearTimeout(retryTimer)
+    }
+  }, [attempt, adoptDocument])
+
+  const retryLoad = useCallback(() => {
+    setLoadState('loading')
+    setAttempt(n => n + 1)
+  }, [])
+
+  const wordCount = useMemo(() => countWords(content), [content])
+
+  let status = content ? 'All changes saved' : 'Nothing written yet'
+  let statusTone = 'text-gray-400 dark:text-gray-500'
+  if (loadState === 'loading') {
+    status = 'Loading…'
+  } else if (loadState === 'failed') {
+    status = 'Not connected'
+    statusTone = 'text-red-600 dark:text-red-400'
+  } else if (error) {
+    status = "Couldn't save — will retry"
+    statusTone = 'text-red-600 dark:text-red-400'
+  } else if (saving) {
+    status = 'Saving…'
+    statusTone = 'text-blue-600 dark:text-blue-300'
+  } else if (dirty) {
+    status = 'Unsaved changes'
+    statusTone = 'text-amber-600 dark:text-amber-400'
+  } else if (lastSavedAt) {
+    status = `Saved at ${formatTime(lastSavedAt)}`
+    statusTone = 'text-green-700 dark:text-green-400'
+  }
+
+  return (
+    <main className="min-h-screen bg-gray-50/70 px-4 py-8 dark:bg-[#1E1E1E] sm:px-6">
+      <section className="mx-auto max-w-4xl">
+        {/* Page header */}
+        <div className="mb-8">
+          <p className="text-sm font-semibold uppercase tracking-wide text-blue-600 dark:text-blue-300">
+            Writing workspace
+          </p>
+          <h1 className="mt-2 text-3xl font-bold tracking-tight text-gray-950 dark:text-white sm:text-4xl">
+            Write without losing your place.
+          </h1>
+          <p className="mt-3 max-w-2xl text-base leading-relaxed text-gray-600 dark:text-gray-300">
+            Your work saves itself every 30 seconds and comes back exactly as you
+            left it — in the same typography you read with.
+          </p>
+        </div>
+
+        <div
+          className="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm
+                     dark:border-gray-800 dark:bg-[#2A2A2A] sm:p-6"
+        >
+          {/* Load failure — the notepad stays read-only until a load succeeds,
+              because autosave can't safely run without knowing what's stored. */}
+          {loadState === 'failed' && (
+            <div
+              className="mb-4 flex flex-wrap items-center gap-3 rounded-2xl border
+                         border-red-200 bg-red-50 p-4 text-sm text-red-800
+                         dark:border-red-900 dark:bg-red-950/40 dark:text-red-200"
+              role="alert"
+            >
+              <span className="flex-1">
+                Couldn't reach your saved writing. Editing is paused so nothing
+                already saved gets overwritten.
+              </span>
+              <button
+                type="button"
+                onClick={retryLoad}
+                className="rounded-xl bg-red-600 px-4 py-2 text-xs font-bold text-white
+                           hover:bg-red-700 focus-visible:outline-2
+                           focus-visible:outline-offset-2 focus-visible:outline-red-500"
+              >
+                Try again
+              </button>
+            </div>
+          )}
+
+          {/* Title + save controls */}
+          <div className="mb-4 flex flex-wrap items-center gap-3">
+            <label className="sr-only" htmlFor="doc-title">
+              Document title
+            </label>
+            <input
+              id="doc-title"
+              type="text"
+              value={title}
+              maxLength={MAX_TITLE_CHARS}
+              onChange={e => setTitle(e.target.value)}
+              onBlur={() => setTitle(t => t.trim() || DEFAULT_TITLE)}
+              placeholder="Untitled"
+              disabled={!ready}
+              className="min-w-0 flex-1 rounded-xl border border-transparent bg-transparent
+                         px-2 py-1.5 text-lg font-semibold text-gray-900
+                         hover:border-gray-200 focus:border-blue-400 focus:outline-none
+                         disabled:opacity-60 dark:text-white dark:hover:border-gray-700"
+            />
+
+            <span className={`text-xs font-semibold ${statusTone}`} aria-live="polite">
+              {status}
+            </span>
+
+            <button
+              type="button"
+              onClick={saveNow}
+              disabled={!ready || saving || !dirty}
+              className="rounded-xl bg-blue-600 px-4 py-2 text-xs font-bold text-white
+                         shadow-sm hover:bg-blue-700 disabled:opacity-50
+                         focus-visible:outline-2 focus-visible:outline-offset-2
+                         focus-visible:outline-blue-500"
+            >
+              Save now
+            </button>
+          </div>
+
+          {/* The notepad */}
+          <label className="sr-only" htmlFor="notepad">
+            Your writing
+          </label>
+          <textarea
+            id="notepad"
+            value={content}
+            maxLength={MAX_CONTENT_CHARS}
+            onChange={e => setContent(e.target.value)}
+            disabled={!ready}
+            placeholder={
+              { ready: 'Start writing…', loading: 'Loading your writing…', failed: '' }[loadState]
+            }
+            spellCheck="false"
+            className="min-h-[24rem] w-full resize-y rounded-2xl border border-gray-200
+                       p-5 text-gray-900 shadow-inner focus:border-blue-400
+                       focus:outline-none disabled:opacity-60
+                       dark:border-gray-700 dark:text-white"
+            style={{
+              fontFamily: `'${prefs.font}', Arial, Verdana, sans-serif`,
+              fontSize: `${prefs.fontSize}px`,
+              lineHeight: String(prefs.lineSpacing),
+              wordSpacing: `${prefs.wordSpacing}px`,
+              backgroundColor: prefs.darkMode ? '#1E1E1E' : prefs.overlay,
+            }}
+          />
+
+          {/* Counters */}
+          <div className="mt-3 flex flex-wrap items-center gap-4 text-xs text-gray-500 dark:text-gray-400">
+            <span>{wordCount.toLocaleString()} {wordCount === 1 ? 'word' : 'words'}</span>
+            <span>
+              {content.length.toLocaleString()} / {MAX_CONTENT_CHARS.toLocaleString()} characters
+            </span>
+            {content.length >= MAX_CONTENT_CHARS && (
+              <span className="font-semibold text-amber-600 dark:text-amber-400">
+                Character limit reached.
+              </span>
+            )}
+          </div>
+        </div>
+      </section>
+    </main>
+  )
+}
