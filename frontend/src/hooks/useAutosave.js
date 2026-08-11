@@ -8,8 +8,8 @@ export const AUTOSAVE_INTERVAL_MS = 30_000
 /**
  * Autosaves the writing notepad into the user's saved document.
  *
- * The caller owns `title` and `content` (the textarea needs them anyway) and
- * tells this hook what the server currently holds by calling adoptDocument()
+ * The caller owns `title`, `content` and the F48 `template` (the page needs them
+ * anyway) and tells this hook what the server currently holds via adoptDocument()
  * once the draft has loaded. Until then `enabled` must stay false: saving
  * against an unknown baseline would push the empty textarea of a page that
  * hasn't finished loading over the user's real saved text.
@@ -17,11 +17,11 @@ export const AUTOSAVE_INTERVAL_MS = 30_000
  * A save fires on the 30s tick, on demand via saveNow(), when the tab is
  * hidden, and on unmount — but only when something actually changed.
  */
-export function useAutosave({ title, content, enabled }) {
+export function useAutosave({ title, content, template, enabled }) {
   const [documentId, setDocumentId] = useState(null)
   // What the server holds. Only ever set from a completed request or from
   // adoptDocument, so it always reflects a real round trip.
-  const [baseline, setBaseline] = useState({ title: '', content: '' })
+  const [baseline, setBaseline] = useState({ title: '', content: '', template: null })
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
   const [lastSavedAt, setLastSavedAt] = useState(null)
@@ -29,19 +29,24 @@ export function useAutosave({ title, content, enabled }) {
   // The timer and the unmount flush need the current values without
   // re-subscribing on every keystroke. Written after each commit rather than
   // during render, which React forbids.
-  const latest = useRef({ title, content, documentId, baseline, saving, enabled })
+  const latest = useRef({ title, content, template, documentId, baseline, saving, enabled })
   useEffect(() => {
-    latest.current = { title, content, documentId, baseline, saving, enabled }
+    latest.current = { title, content, template, documentId, baseline, saving, enabled }
   })
 
-  const dirty = enabled && (title !== baseline.title || content !== baseline.content)
+  const dirty =
+    enabled &&
+    (title !== baseline.title ||
+      content !== baseline.content ||
+      template !== baseline.template)
 
   const save = useCallback(async () => {
     const snapshot = latest.current
     if (!snapshot.enabled || snapshot.saving) return
     if (
       snapshot.title === snapshot.baseline.title &&
-      snapshot.content === snapshot.baseline.content
+      snapshot.content === snapshot.baseline.content &&
+      snapshot.template === snapshot.baseline.template
     ) {
       return // nothing changed since the last successful save
     }
@@ -55,9 +60,16 @@ export function useAutosave({ title, content, enabled }) {
         document_id: snapshot.documentId,
         title: snapshot.title,
         content: snapshot.content,
+        template: snapshot.template,
       })
       setDocumentId(saved.id)
-      setBaseline({ title: snapshot.title, content: snapshot.content })
+      // The server's echo is the truth for template: it ignores a null, so a
+      // save that didn't carry one keeps whatever was already recorded.
+      setBaseline({
+        title: snapshot.title,
+        content: snapshot.content,
+        template: saved.template ?? null,
+      })
       setLastSavedAt(new Date())
     } catch (err) {
       // 404 means the document is gone (deleted elsewhere); forget the id so
@@ -72,7 +84,11 @@ export function useAutosave({ title, content, enabled }) {
   /** Record what the server already has, after the draft has been fetched. */
   const adoptDocument = useCallback(doc => {
     setDocumentId(doc?.id ?? null)
-    setBaseline({ title: doc?.title ?? '', content: doc?.content ?? '' })
+    setBaseline({
+      title: doc?.title ?? '',
+      content: doc?.content ?? '',
+      template: doc?.template ?? null,
+    })
     setLastSavedAt(null)
     setError(null)
   }, [])

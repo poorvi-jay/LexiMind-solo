@@ -2,11 +2,15 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 
 import HighlightedEditor from '../components/HighlightedEditor.jsx'
 import SuggestionBar from '../components/SuggestionBar.jsx'
+import TemplateSelector from '../components/TemplateSelector.jsx'
 import WritingChecks from '../components/WritingChecks.jsx'
+import { Toast } from '../components/Toast.jsx'
 import { api } from '../utils/api'
 import { useAutosave } from '../hooks/useAutosave'
 import { useNLP } from '../hooks/useNLP'
 import { usePrefs } from '../context/PreferencesContext'
+import { useToast } from '../hooks/useToast.js'
+import { useTTSPlayer } from '../hooks/useTTSPlayer'
 import { useWordPredict } from '../hooks/useWordPredict'
 
 /** Matches MAX_CONTENT_CHARS in backend/routers/writing.py. */
@@ -26,6 +30,16 @@ function countWords(text) {
   return trimmed ? trimmed.split(/\s+/).length : 0
 }
 
+/**
+ * F47 — the last sentence that actually finished. Anything after the final
+ * terminator is still being written, so reading it back would cut off
+ * mid-thought; with nothing finished yet the whole text is the best we have.
+ */
+function lastCompleteSentence(text) {
+  const sentences = text.match(/[^.!?]+[.!?]+/g)
+  return (sentences ? sentences[sentences.length - 1] : text).trim()
+}
+
 function formatTime(date) {
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
@@ -40,8 +54,12 @@ function formatTime(date) {
 export default function WritingPage() {
   const { prefs } = usePrefs()
 
+  const { toast, showToast, hideToast } = useToast()
+
   const [title, setTitle] = useState(DEFAULT_TITLE)
   const [content, setContent] = useState('')
+  // F48 — which scaffold this document was started from, saved alongside it.
+  const [template, setTemplate] = useState(null)
   // 'loading' → still fetching (including automatic retries)
   // 'ready'   → baseline known, autosave armed
   // 'failed'  → out of automatic retries, waiting on the user
@@ -53,6 +71,7 @@ export default function WritingPage() {
   const { dirty, saving, error, lastSavedAt, saveNow, adoptDocument } = useAutosave({
     title,
     content,
+    template,
     enabled: ready,
   })
 
@@ -70,10 +89,11 @@ export default function WritingPage() {
         if (doc) {
           setTitle(doc.title)
           setContent(doc.content)
+          setTemplate(doc.template ?? null)
         }
         // With nothing saved yet the baseline is the blank page as rendered,
         // otherwise the default title alone would read as an unsaved change.
-        adoptDocument(doc ?? { id: null, title: DEFAULT_TITLE, content: '' })
+        adoptDocument(doc ?? { id: null, title: DEFAULT_TITLE, content: '', template: null })
         setLoadState('ready')
       })
       .catch(() => {
@@ -160,6 +180,74 @@ export default function WritingPage() {
     textarea.focus()
     textarea.setSelectionRange(position, position)
   }, [content])
+
+  /* ── Apply a structure template (F48) ── */
+  // `mode` comes from TemplateSelector, which asks the writer before it can be
+  // 'replace' on a page that already has text.
+  const applyTemplate = useCallback(
+    (id, scaffold, mode) => {
+      const keep = mode === 'append' && content.trim() ? `${content.replace(/\s+$/, '')}\n\n` : ''
+      const next = keep + scaffold
+
+      setContent(next)
+      setTemplate(id)
+      // Land the caret at the end of the scaffold's first line — the title or
+      // subject — rather than at the very end, which is the bottom of the page.
+      const firstLineEnd = scaffold.indexOf('\n')
+      const caretAt = keep.length + (firstLineEnd >= 0 ? firstLineEnd : scaffold.length)
+      setCaret(caretAt)
+      pendingCaretRef.current = caretAt
+    },
+    [content]
+  )
+
+  /* ── Read aloud · F30 selection, F47 Alt+R ── */
+  // Playback only, so the word-by-word callback the reading page uses to move
+  // its highlight has nothing to do here.
+  const {
+    play: playTTS,
+    stop: stopTTS,
+    isPlaying: reading,
+    isLoading: preparingAudio,
+    error: ttsError,
+  } = useTTSPlayer(useCallback(() => {}, []))
+
+  const readAloud = useCallback(() => {
+    const textarea = notepadRef.current
+    // A selection is an explicit "read this"; without one, fall back to the
+    // last finished sentence (AC-37).
+    const selected =
+      textarea && textarea.selectionStart !== textarea.selectionEnd
+        ? content.slice(textarea.selectionStart, textarea.selectionEnd).trim()
+        : ''
+    const passage = selected || lastCompleteSentence(content)
+
+    if (!passage) {
+      showToast('Write something first, then press Alt+R to hear it.', 'info')
+      return
+    }
+    playTTS(passage, 1.0, prefs.phrasePauses)
+  }, [content, playTTS, prefs.phrasePauses, showToast])
+
+  useEffect(() => {
+    const handler = event => {
+      // e.key is layout-dependent (and not always 'r' with Alt held), so accept
+      // the physical key too.
+      if (!event.altKey || event.ctrlKey || event.metaKey) return
+      if (event.code !== 'KeyR' && event.key?.toLowerCase() !== 'r') return
+      event.preventDefault()
+      readAloud()
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [readAloud])
+
+  // Leaving the page must not leave a voice talking over the next one.
+  useEffect(() => stopTTS, [stopTTS])
+
+  useEffect(() => {
+    if (ttsError) showToast(`Could not read that aloud: ${ttsError}`, 'error')
+  }, [ttsError, showToast])
 
   // Shared by the textarea and the highlight mirror behind it — any difference
   // in these would wrap the two differently and slide the marks off the words.
@@ -299,6 +387,34 @@ export default function WritingPage() {
             </button>
           </div>
 
+          {/* Structure templates (F48) + read-back (F30, F47) */}
+          <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+            <TemplateSelector
+              value={template}
+              hasContent={Boolean(content.trim())}
+              disabled={!ready}
+              onApply={applyTemplate}
+            />
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={reading ? stopTTS : readAloud}
+                disabled={!ready || preparingAudio}
+                aria-keyshortcuts="Alt+R"
+                title="Reads your selection, or the last complete sentence (Alt+R)"
+                className="rounded-xl border border-gray-200 px-4 py-2 text-xs font-bold
+                           text-gray-700 hover:border-gray-300 hover:bg-gray-50
+                           disabled:opacity-50 focus-visible:outline-2
+                           focus-visible:outline-offset-2 focus-visible:outline-blue-500
+                           dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-800"
+              >
+                {preparingAudio ? 'Preparing…' : reading ? 'Stop reading' : 'Read aloud'}
+              </button>
+              <span className="text-[11px] text-gray-400 dark:text-gray-500">Alt+R</span>
+            </div>
+          </div>
+
           {/* The notepad */}
           <label className="sr-only" htmlFor="notepad">
             Your writing
@@ -367,6 +483,8 @@ export default function WritingPage() {
           </div>
         </div>
       </section>
+
+      {toast && <Toast message={toast.message} type={toast.type} onClose={hideToast} />}
     </main>
   )
 }

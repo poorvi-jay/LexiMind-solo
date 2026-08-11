@@ -1,6 +1,6 @@
 """
 backend/routers/writing.py
-F25 writing notepad · F31 autosave
+F25 writing notepad · F31 autosave · F48 template recorded on the document
 
 Endpoints: GET /writing/autosave, PATCH /writing/autosave
 
@@ -15,6 +15,7 @@ Phase 7's CRUD will list and open, so nothing here needs revisiting then.
 """
 
 from datetime import datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -38,6 +39,11 @@ class AutosaveRequest(BaseModel):
     document_id: str | None = None
     title: str | None = Field(default=None, max_length=MAX_TITLE_CHARS)
     content: str = Field(max_length=MAX_CONTENT_CHARS)
+    # F48 — which structure template the writer started from, recorded on the
+    # document so it can be logged with the session. Omitted (or null) leaves
+    # whatever is stored alone, the same "no change" meaning `title` has; a
+    # client that hasn't touched the dropdown must not blank an earlier choice.
+    template: Literal["essay", "email", "report"] | None = None
 
 
 class DocumentOut(BaseModel):
@@ -107,6 +113,8 @@ def autosave(
         doc.content = req.content
         if req.title is not None:
             doc.title = req.title.strip() or DEFAULT_TITLE
+        if req.template is not None:
+            doc.template = req.template
     else:
         # Don't leave an empty row behind for a page that was only ever opened.
         if not req.content.strip():
@@ -115,6 +123,7 @@ def autosave(
             user_id=current_user.id,
             title=(req.title or "").strip() or DEFAULT_TITLE,
             content=req.content,
+            template=req.template,
         )
         db.add(doc)
 
