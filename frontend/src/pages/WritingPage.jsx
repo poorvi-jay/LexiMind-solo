@@ -1,7 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
+import HighlightedEditor from '../components/HighlightedEditor.jsx'
+import WritingChecks from '../components/WritingChecks.jsx'
 import { api } from '../utils/api'
 import { useAutosave } from '../hooks/useAutosave'
+import { useNLP } from '../hooks/useNLP'
 import { usePrefs } from '../context/PreferencesContext'
 
 /** Matches MAX_CONTENT_CHARS in backend/routers/writing.py. */
@@ -96,6 +99,41 @@ export default function WritingPage() {
     setAttempt(n => n + 1)
   }, [])
 
+  const checks = useNLP(content, { enabled: ready })
+
+  const notepadRef = useRef(null)
+
+  // Shared by the textarea and the highlight mirror behind it — any difference
+  // in these would wrap the two differently and slide the marks off the words.
+  const editorStyle = useMemo(
+    () => ({
+      fontFamily: `'${prefs.font}', Arial, Verdana, sans-serif`,
+      fontSize: `${prefs.fontSize}px`,
+      lineHeight: String(prefs.lineSpacing),
+      wordSpacing: `${prefs.wordSpacing}px`,
+      scrollbarGutter: 'stable',
+    }),
+    [prefs.font, prefs.fontSize, prefs.lineSpacing, prefs.wordSpacing]
+  )
+
+  /* ── Jump to a flagged word (F26-F28) ── */
+  const locateIssue = useCallback(issue => {
+    const textarea = notepadRef.current
+    if (!textarea) return
+    textarea.focus()
+    textarea.setSelectionRange(issue.start, issue.end)
+  }, [])
+
+  /* ── Apply a suggestion (F26-F28) ── */
+  const applySuggestion = useCallback((issue, suggestion) => {
+    setContent(current => {
+      // Guard against a race with a keystroke that landed between the check
+      // and the click: only replace when the span still holds what was flagged.
+      if (current.slice(issue.start, issue.end) !== issue.text) return current
+      return current.slice(0, issue.start) + suggestion + current.slice(issue.end)
+    })
+  }, [])
+
   const wordCount = useMemo(() => countWords(content), [content])
 
   let status = content ? 'All changes saved' : 'Nothing written yet'
@@ -121,7 +159,7 @@ export default function WritingPage() {
 
   return (
     <main className="min-h-screen bg-gray-50/70 px-4 py-8 dark:bg-[#1E1E1E] sm:px-6">
-      <section className="mx-auto max-w-4xl">
+      <section className="mx-auto max-w-6xl">
         {/* Page header */}
         <div className="mb-8">
           <p className="text-sm font-semibold uppercase tracking-wide text-blue-600 dark:text-blue-300">
@@ -136,6 +174,7 @@ export default function WritingPage() {
           </p>
         </div>
 
+        <div className="grid gap-6 lg:grid-cols-[1fr_20rem]">
         <div
           className="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm
                      dark:border-gray-800 dark:bg-[#2A2A2A] sm:p-6"
@@ -206,8 +245,9 @@ export default function WritingPage() {
           <label className="sr-only" htmlFor="notepad">
             Your writing
           </label>
-          <textarea
+          <HighlightedEditor
             id="notepad"
+            textareaRef={notepadRef}
             value={content}
             maxLength={MAX_CONTENT_CHARS}
             onChange={e => setContent(e.target.value)}
@@ -215,18 +255,12 @@ export default function WritingPage() {
             placeholder={
               { ready: 'Start writing…', loading: 'Loading your writing…', failed: '' }[loadState]
             }
-            spellCheck="false"
-            className="min-h-[24rem] w-full resize-y rounded-2xl border border-gray-200
-                       p-5 text-gray-900 shadow-inner focus:border-blue-400
-                       focus:outline-none disabled:opacity-60
-                       dark:border-gray-700 dark:text-white"
-            style={{
-              fontFamily: `'${prefs.font}', Arial, Verdana, sans-serif`,
-              fontSize: `${prefs.fontSize}px`,
-              lineHeight: String(prefs.lineSpacing),
-              wordSpacing: `${prefs.wordSpacing}px`,
-              backgroundColor: prefs.darkMode ? '#1E1E1E' : prefs.overlay,
-            }}
+            issues={checks.issues}
+            // Offsets only line up with the text that was checked, so marks are
+            // hidden the moment it changes and return with the next check.
+            showHighlights={!checks.stale}
+            style={editorStyle}
+            background={prefs.darkMode ? '#1E1E1E' : prefs.overlay}
           />
 
           {/* Counters */}
@@ -240,6 +274,22 @@ export default function WritingPage() {
                 Character limit reached.
               </span>
             )}
+          </div>
+        </div>
+
+          <div className="lg:sticky lg:top-24 lg:self-start">
+            <WritingChecks
+              issues={checks.issues}
+              counts={checks.counts}
+              checking={checks.checking}
+              stale={checks.stale}
+              grammarAvailable={checks.grammarAvailable}
+              error={checks.error}
+              hasText={Boolean(content.trim())}
+              text={content}
+              onApply={applySuggestion}
+              onLocate={locateIssue}
+            />
           </div>
         </div>
       </section>

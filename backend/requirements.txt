@@ -1,0 +1,62 @@
+# LexiMind backend dependencies (Python 3.11)
+#
+#   python -m venv venv
+#   venv/Scripts/pip install -r backend/requirements.txt
+#
+# Direct dependencies only — transitive ones are left to the resolver so this
+# file stays readable. Versions are pinned to what M1/M2 were built and
+# verified against.
+#
+# ── Non-pip prerequisites ─────────────────────────────────────────────────
+# Java 8+      grammar checking (F27) runs LanguageTool, which is a Java
+#              program. Without it /nlp/check still returns spelling and
+#              homophone results and reports grammar_available: false.
+#              Windows: winget install EclipseAdoptium.Temurin.21.JRE
+#              On first use language_tool_python downloads LanguageTool
+#              (~259 MB) into its own cache; expect a ~60s first startup.
+#              If java is installed but not on PATH, set JAVA_HOME in
+#              backend/.env — dotenv loads before the NLP service starts.
+# Poppler      pdf2image shells out to it for PDF page rendering (F05).
+#
+# Downloaded at runtime on first use, no action needed:
+#   - NLTK cmudict (syllable counts in routers/reading.py)
+#   - EasyOCR detection/recognition models (~100 MB, first OCR call)
+
+# ── web framework ─────────────────────────────────────────────────────────
+fastapi==0.139.0
+uvicorn==0.49.0
+pydantic==2.13.4
+python-dotenv==1.2.2
+python-multipart==0.0.32        # multipart/form-data for the OCR upload endpoints
+
+# ── database + auth (M2 phase 0/1) ────────────────────────────────────────
+SQLAlchemy==2.0.51
+python-jose==3.5.0              # HS256 JWTs
+bcrypt==5.0.0                   # called directly; passlib is NOT used — it is
+                                # unmaintained and crashes against bcrypt 5.x
+email-validator==2.3.0          # backs pydantic's EmailStr
+
+# ── OCR + reading (M1) ────────────────────────────────────────────────────
+easyocr==1.7.2
+opencv-python-headless==5.0.0.93
+pdf2image==1.17.0
+pdfplumber==0.11.10
+numpy==2.4.6
+
+# ── text-to-speech + simplification (M1) ──────────────────────────────────
+edge-tts==7.2.8
+groq==1.6.0                     # needs GROQ_API_KEY in backend/.env
+httpx==0.28.1                   # dictionary lookups in routers/reading.py
+
+# ── NLP writing checks (M2 phase 4) ───────────────────────────────────────
+nltk==3.9.4                     # cmudict syllable counts
+wordfreq==3.1.1                 # word frequencies for the spelling vocabulary
+jellyfish==1.2.1                # metaphone/soundex for phonetic suggestions (F26)
+spacy==3.8.15                   # POS + dependency parse for homophones (F28)
+language-tool-python==3.4.0     # grammar (F27) — requires Java, see above
+lemminflect==0.2.3              # past-tense forms for the tense-consistency check
+
+# The spaCy English model is a package, not a download at runtime. Either
+# install it from this pinned wheel, or run:
+#   python -m spacy download en_core_web_sm
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl

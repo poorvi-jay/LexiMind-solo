@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import os
+import threading
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -9,11 +10,18 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from backend.database import init_db
+from backend.services import nlp_service
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()  # create any missing tables (no Alembic — SQLite + create_all)
+
+    # spaCy's model, the phonetic index and LanguageTool's JVM together take
+    # ~10-20s to build. Warming them on a daemon thread keeps startup instant;
+    # the first /nlp/check just blocks on the same lock until it's ready.
+    threading.Thread(target=nlp_service.warm_up, name="nlp-warmup", daemon=True).start()
+
     yield
 
 
@@ -45,12 +53,14 @@ from backend.routers.tts import router as tts_router
 from backend.routers.reading import router as reading_router
 from backend.routers.classify import router as classify_router  # import the classify router
 from backend.routers.writing import router as writing_router
+from backend.routers.nlp import router as nlp_router
 app.include_router(auth_router, tags=["Auth"])
 app.include_router(ocr_router, tags=["OCR"])
 app.include_router(tts_router, tags=["TTS"])
 app.include_router(reading_router, tags=["Reading"])
 app.include_router(classify_router, tags=["Classify"])  # include the classify router with a tag
 app.include_router(writing_router, tags=["Writing"])
+app.include_router(nlp_router, tags=["NLP"])
 @app.get("/health")
 async def health():
     return {"status": "ok", "version": "5.0"}
