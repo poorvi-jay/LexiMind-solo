@@ -1,11 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import HighlightedEditor from '../components/HighlightedEditor.jsx'
+import SuggestionBar from '../components/SuggestionBar.jsx'
 import WritingChecks from '../components/WritingChecks.jsx'
 import { api } from '../utils/api'
 import { useAutosave } from '../hooks/useAutosave'
 import { useNLP } from '../hooks/useNLP'
 import { usePrefs } from '../context/PreferencesContext'
+import { useWordPredict } from '../hooks/useWordPredict'
 
 /** Matches MAX_CONTENT_CHARS in backend/routers/writing.py. */
 const MAX_CONTENT_CHARS = 50_000
@@ -102,6 +104,62 @@ export default function WritingPage() {
   const checks = useNLP(content, { enabled: ready })
 
   const notepadRef = useRef(null)
+
+  // Prediction is about the caret, not the document, so it has to follow the
+  // cursor as well as the text — clicking into the middle of a sentence should
+  // predict from there rather than from the end.
+  const [caret, setCaret] = useState(0)
+  const trackCaret = useCallback(event => setCaret(event.target.selectionStart), [])
+  const pendingCaretRef = useRef(null)
+
+  const predictions = useWordPredict(content.slice(0, caret), { enabled: ready })
+
+  /* ── Insert a suggestion at the caret (F29) ── */
+  const insertSuggestion = useCallback(
+    suggestion => {
+      const textarea = notepadRef.current
+      if (!textarea) return
+
+      const position = textarea.selectionStart
+      const before = content.slice(0, position)
+      const after = content.slice(position)
+
+      // Mid-word, the pill completes the word being typed, so the partial word
+      // it replaces has to come out first.
+      const partial = before.match(/[A-Za-z']+$/)
+      const head = partial ? before.slice(0, before.length - partial[0].length) : before
+
+      // At a boundary the caret may sit straight after punctuation ("The end.")
+      // where an inserted word would otherwise collide with it.
+      const needsSpace = !partial && head.length > 0 && !/\s$/.test(head)
+      // A trailing space saves a keystroke and is what word prediction
+      // elsewhere does — but not if the following text already starts with one.
+      const trailing = after && /^\s/.test(after) ? '' : ' '
+      const insertion = `${needsSpace ? ' ' : ''}${suggestion}${trailing}`
+
+      const nextCaret = head.length + insertion.length
+      setContent(head + insertion + after)
+      setCaret(nextCaret)
+      // Applied by the layout effect below, once the new value is in the DOM.
+      pendingCaretRef.current = nextCaret
+    },
+    [content]
+  )
+
+  // Put the cursor back after an insertion so typing continues where the
+  // suggestion left off. This has to happen after React commits the new value,
+  // and in a layout effect rather than requestAnimationFrame — rAF is throttled
+  // in a background tab, which left the caret stranded and focus on <body>.
+  useLayoutEffect(() => {
+    const position = pendingCaretRef.current
+    if (position == null) return
+    pendingCaretRef.current = null
+
+    const textarea = notepadRef.current
+    if (!textarea) return
+    textarea.focus()
+    textarea.setSelectionRange(position, position)
+  }, [content])
 
   // Shared by the textarea and the highlight mirror behind it — any difference
   // in these would wrap the two differently and slide the marks off the words.
@@ -250,7 +308,11 @@ export default function WritingPage() {
             textareaRef={notepadRef}
             value={content}
             maxLength={MAX_CONTENT_CHARS}
-            onChange={e => setContent(e.target.value)}
+            onChange={e => {
+              setContent(e.target.value)
+              trackCaret(e)
+            }}
+            onSelect={trackCaret}
             disabled={!ready}
             placeholder={
               { ready: 'Start writing…', loading: 'Loading your writing…', failed: '' }[loadState]
@@ -262,6 +324,17 @@ export default function WritingPage() {
             style={editorStyle}
             background={prefs.darkMode ? '#1E1E1E' : prefs.overlay}
           />
+
+          {/* Word + phrase prediction, kept next to the caret rather than in
+              the sidebar — these are for reaching for mid-sentence. */}
+          {ready && (
+            <SuggestionBar
+              words={predictions.words}
+              phrase={predictions.phrase}
+              predicting={predictions.predicting}
+              onInsert={insertSuggestion}
+            />
+          )}
 
           {/* Counters */}
           <div className="mt-3 flex flex-wrap items-center gap-4 text-xs text-gray-500 dark:text-gray-400">
@@ -284,6 +357,7 @@ export default function WritingPage() {
               checking={checks.checking}
               stale={checks.stale}
               grammarAvailable={checks.grammarAvailable}
+              checksAvailable={checks.checksAvailable}
               error={checks.error}
               hasText={Boolean(content.trim())}
               text={content}

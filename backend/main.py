@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from backend.database import init_db
-from backend.services import nlp_service
+from backend.services import nlp_service, prediction_service
 
 
 @asynccontextmanager
@@ -21,6 +21,12 @@ async def lifespan(app: FastAPI):
     # ~10-20s to build. Warming them on a daemon thread keeps startup instant;
     # the first /nlp/check just blocks on the same lock until it's ready.
     threading.Thread(target=nlp_service.warm_up, name="nlp-warmup", daemon=True).start()
+
+    # DistilGPT-2 plus the prefix vocabulary, on its own thread so a slow model
+    # load doesn't hold up the checks warming beside it.
+    threading.Thread(
+        target=prediction_service.warm_up, name="predict-warmup", daemon=True
+    ).start()
 
     yield
 

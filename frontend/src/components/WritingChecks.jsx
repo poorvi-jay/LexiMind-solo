@@ -65,6 +65,7 @@ export default function WritingChecks({
   checking,
   stale,
   grammarAvailable,
+  checksAvailable,
   error,
   hasText,
   text,
@@ -91,11 +92,18 @@ export default function WritingChecks({
 
       <Summary counts={counts} />
 
-      {!grammarAvailable && (
-        <p className="rounded-xl bg-gray-50 p-3 text-xs text-gray-500 dark:bg-[#333] dark:text-gray-400">
-          Grammar checking is unavailable — spelling and word choice are still
-          being checked.
+      {checksAvailable === false ? (
+        <p className="rounded-xl bg-amber-50 p-3 text-xs text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+          Writing checks are unavailable right now. Your work still saves
+          normally, and word suggestions keep working.
         </p>
+      ) : (
+        !grammarAvailable && (
+          <p className="rounded-xl bg-gray-50 p-3 text-xs text-gray-500 dark:bg-[#333] dark:text-gray-400">
+            Grammar checking is unavailable — spelling and word choice are still
+            being checked.
+          </p>
+        )
       )}
 
       {error && (

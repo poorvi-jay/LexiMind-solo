@@ -57,6 +57,7 @@ export default function HighlightedEditor({
   textareaRef,
   value,
   onChange,
+  onSelect,
   disabled,
   placeholder,
   maxLength,
@@ -113,6 +114,7 @@ export default function HighlightedEditor({
         value={value}
         maxLength={maxLength}
         onChange={onChange}
+        onSelect={onSelect}
         onScroll={syncScroll}
         disabled={disabled}
         placeholder={placeholder}

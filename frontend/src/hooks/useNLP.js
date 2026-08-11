@@ -22,6 +22,8 @@ export function useNLP(text, { enabled = true } = {}) {
   const [counts, setCounts] = useState(EMPTY_COUNTS)
   const [checking, setChecking] = useState(false)
   const [grammarAvailable, setGrammarAvailable] = useState(true)
+  // False when spaCy itself can't load — every check depends on its parse.
+  const [checksAvailable, setChecksAvailable] = useState(true)
   const [error, setError] = useState(null)
   // The text the current `issues` were computed from. The offsets are only
   // valid against that exact string, so the UI can tell when they're stale.
@@ -62,6 +64,7 @@ export function useNLP(text, { enabled = true } = {}) {
           setIssues(data.issues || [])
           setCounts(data.counts || EMPTY_COUNTS)
           setGrammarAvailable(Boolean(data.grammar_available))
+          setChecksAvailable(data.checks_available !== false)
           setCheckedText(text)
           setError(null)
         })
@@ -82,6 +85,7 @@ export function useNLP(text, { enabled = true } = {}) {
     counts,
     checking,
     grammarAvailable,
+    checksAvailable,
     error,
     // Offsets only line up while the text is unchanged since the last check.
     stale: checkedText !== text,

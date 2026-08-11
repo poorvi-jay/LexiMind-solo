@@ -56,6 +56,11 @@ spacy==3.8.15                   # POS + dependency parse for homophones (F28)
 language-tool-python==3.4.0     # grammar (F27) — requires Java, see above
 lemminflect==0.2.3              # past-tense forms for the tense-consistency check
 
+# ── word + phrase prediction (M2 phase 5) ─────────────────────────────────
+transformers==5.15.0            # DistilGPT-2 for next-word and phrase suggestions
+# torch is pulled in by easyocr above; prediction reuses that same CPU install.
+# DistilGPT-2 itself (~350 MB) downloads to the Hugging Face cache on first use.
+
 # The spaCy English model is a package, not a download at runtime. Either
 # install it from this pinned wheel, or run:
 #   python -m spacy download en_core_web_sm

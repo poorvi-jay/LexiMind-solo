@@ -16,8 +16,13 @@ import threading
 from pathlib import Path
 
 import jellyfish
-import spacy
 import wordfreq
+
+# spaCy is imported lazily inside _get_spacy(). It is a heavy optional
+# dependency — its compiled extensions can be refused by the OS (Windows Smart
+# App Control blocks unsigned .pyd files), and importing it at module scope made
+# that failure take down the entire API, auth and reading included, rather than
+# just the writing checks.
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +79,7 @@ DETERMINERS = {"the", "a", "an", "this", "that", "these", "those", "any", "no"}
 # ── lazily built resources ─────────────────────────────────────────────
 _lock = threading.Lock()
 _spacy_nlp = None
+_spacy_error = None
 _phonetic_index = None
 _dictionary = None
 _language_tool = None
@@ -103,6 +109,18 @@ def _is_valid_word(word: str) -> bool:
     return zipf >= MIN_DICTIONARY_ZIPF and word in _get_dictionary()
 
 
+def is_real_word(word: str) -> bool:
+    """
+    Public form of the spelling test, shared with prediction_service.
+
+    Word prediction must never offer a misspelling as a completion, and
+    wordfreq's frequency list contains plenty of them ("recieve" is common
+    enough on the web to rank). Reusing this keeps one definition of what
+    counts as a real word instead of two that can drift apart.
+    """
+    return _is_valid_word(word)
+
+
 def _get_phonetic_index() -> dict:
     """
     metaphone/soundex code -> candidate words, best first.
@@ -128,13 +146,88 @@ def _get_phonetic_index() -> dict:
     return _phonetic_index
 
 
+def _skip_edit_tree_lemmatizer() -> None:
+    """
+    Let spaCy import when its edit_trees extension can't be loaded.
+
+    `spacy/pipeline/__init__.py` imports EditTreeLemmatizer unconditionally, and
+    that pulls in a compiled `edit_trees` extension. If the OS refuses to load
+    that one file — Windows Smart App Control blocks unsigned .pyd files, and
+    picked this one — the whole of spaCy becomes unimportable, even though every
+    other extension in the package loads fine.
+
+    en_core_web_sm uses the rule-based `lemmatizer`, never the trainable
+    EditTreeLemmatizer, so registering a placeholder costs us nothing that this
+    project uses: the pipeline still loads tok2vec, tagger, parser,
+    attribute_ruler and lemmatizer, which is everything the checks read.
+
+    This does not work around the block — the blocked file is simply never
+    loaded. Anything that genuinely needs EditTrees raises instead.
+    """
+    import sys
+    import types
+
+    name = "spacy.pipeline._edit_tree_internals.edit_trees"
+    if name in sys.modules:
+        return
+
+    # The failed import leaves half of spaCy cached in sys.modules. Those stale
+    # submodules survive the retry but were bound to the discarded `spacy`
+    # module object, so the fresh one never regains its attributes — which broke
+    # lemminflect, whose import does `spacy.tokens.Token.set_extension(...)`.
+    # Clearing them makes the retry a genuinely fresh import.
+    for module in [m for m in sys.modules if m == "spacy" or m.startswith("spacy.")]:
+        del sys.modules[module]
+
+    placeholder = types.ModuleType(name)
+
+    class EditTrees:  # pragma: no cover — only reachable if something uses it
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(
+                "spaCy's edit_trees extension could not be loaded on this machine, "
+                "so the trainable lemmatizer is unavailable."
+            )
+
+    placeholder.EditTrees = EditTrees
+    sys.modules[name] = placeholder
+
+
 def _get_spacy():
-    global _spacy_nlp
-    if _spacy_nlp is None:
-        # The parser is what gives us heads and dependencies for the homophone
-        # rules; NER is dead weight here.
-        _spacy_nlp = spacy.load("en_core_web_sm", exclude=["ner"])
+    """The parsed-language model, or None when spaCy can't be loaded."""
+    global _spacy_nlp, _spacy_error
+    if _spacy_nlp is None and _spacy_error is None:
+        try:
+            try:
+                import spacy
+            except ImportError as exc:
+                # Only retry for the one component we know we can do without;
+                # any other import failure is real and should surface.
+                if "edit_trees" not in str(exc):
+                    raise
+                logger.warning(
+                    "spaCy's edit_trees extension is blocked (%s); loading without "
+                    "the trainable lemmatizer, which this project does not use.",
+                    exc,
+                )
+                _skip_edit_tree_lemmatizer()
+                import spacy
+
+            # The parser is what gives us heads and dependencies for the
+            # homophone rules; NER is dead weight here.
+            _spacy_nlp = spacy.load("en_core_web_sm", exclude=["ner"])
+        except Exception as exc:  # noqa: BLE001 — missing model, blocked DLL
+            _spacy_error = str(exc)
+            logger.warning("Writing checks unavailable: %s", exc)
     return _spacy_nlp
+
+
+def checks_status() -> tuple[bool, str | None]:
+    """(available, reason-if-not) for the spaCy-backed checks."""
+    if _spacy_nlp is not None:
+        return True, None
+    if _spacy_error is not None:
+        return False, _spacy_error
+    return False, "Writing checks are still starting up."
 
 
 def _ensure_java_on_path() -> None:
@@ -195,7 +288,12 @@ def grammar_status() -> tuple[bool, str | None]:
 
 
 def warm_up() -> None:
-    """Build every cached resource. Called once at startup, off the event loop."""
+    """
+    Build every cached resource. Called once at startup, off the event loop.
+
+    Each loader records its own failure rather than raising, so one unavailable
+    dependency doesn't stop the others from warming.
+    """
     with _lock:
         _get_dictionary()
         _get_phonetic_index()
@@ -511,16 +609,28 @@ def _grammar_issues(text: str, sentence_starts: set[int]) -> tuple[list[dict], l
 # ── public entry point ─────────────────────────────────────────────────
 def check_text(text: str) -> dict:
     """Run all three checks and return issues sorted by position."""
-    if not text.strip():
-        available, reason = grammar_status()
+    def empty(checks_available=True, checks_reason=None):
+        grammar_available, grammar_reason = grammar_status()
         return {
             "issues": [],
             "counts": {"spelling": 0, "grammar": 0, "homophone": 0},
-            "grammar_available": available,
-            "grammar_unavailable_reason": None if available else reason,
+            "grammar_available": grammar_available,
+            "grammar_unavailable_reason": None if grammar_available else grammar_reason,
+            "checks_available": checks_available,
+            "checks_unavailable_reason": checks_reason,
         }
 
-    doc = _get_spacy()(text)
+    if not text.strip():
+        return empty()
+
+    nlp = _get_spacy()
+    if nlp is None:
+        # Every check is built on the spaCy parse, so without it there is
+        # nothing to report — but the notepad itself keeps working.
+        available, reason = checks_status()
+        return empty(checks_available=available, checks_reason=reason)
+
+    doc = nlp(text)
 
     spelling = _spelling_issues(doc)
     homophones = _homophone_issues(doc)
@@ -556,4 +666,6 @@ def check_text(text: str) -> dict:
         },
         "grammar_available": available,
         "grammar_unavailable_reason": None if available else reason,
+        "checks_available": True,
+        "checks_unavailable_reason": None,
     }
