@@ -40,18 +40,22 @@ export function useAutosave({ title, content, template, enabled }) {
       content !== baseline.content ||
       template !== baseline.template)
 
+  // Resolves true when the server is up to date — either the save landed or
+  // there was nothing to send. Callers that are about to replace what's in the
+  // notepad (opening another document) must not proceed on false.
   const save = useCallback(async () => {
     const snapshot = latest.current
-    if (!snapshot.enabled || snapshot.saving) return
+    if (!snapshot.enabled) return true
+    if (snapshot.saving) return false // a request is already in flight
     if (
       snapshot.title === snapshot.baseline.title &&
       snapshot.content === snapshot.baseline.content &&
       snapshot.template === snapshot.baseline.template
     ) {
-      return // nothing changed since the last successful save
+      return true // nothing changed since the last successful save
     }
     // An untouched page shouldn't leave an empty document behind.
-    if (!snapshot.documentId && !snapshot.content.trim()) return
+    if (!snapshot.documentId && !snapshot.content.trim()) return true
 
     setSaving(true)
     setError(null)
@@ -71,11 +75,13 @@ export function useAutosave({ title, content, template, enabled }) {
         template: saved.template ?? null,
       })
       setLastSavedAt(new Date())
+      return true
     } catch (err) {
       // 404 means the document is gone (deleted elsewhere); forget the id so
       // the next save writes a fresh one instead of failing forever.
       if (err instanceof ApiError && err.status === 404) setDocumentId(null)
       setError(err?.message || 'Could not save.')
+      return false
     } finally {
       setSaving(false)
     }

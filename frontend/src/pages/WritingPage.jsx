@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
+import DocumentList from '../components/DocumentList.jsx'
 import HighlightedEditor from '../components/HighlightedEditor.jsx'
 import SuggestionBar from '../components/SuggestionBar.jsx'
 import TemplateSelector from '../components/TemplateSelector.jsx'
@@ -7,6 +8,7 @@ import WritingChecks from '../components/WritingChecks.jsx'
 import { Toast } from '../components/Toast.jsx'
 import { api } from '../utils/api'
 import { useAutosave } from '../hooks/useAutosave'
+import { useDocuments } from '../hooks/useDocuments'
 import { useNLP } from '../hooks/useNLP'
 import { usePrefs } from '../context/PreferencesContext'
 import { useToast } from '../hooks/useToast.js'
@@ -28,6 +30,25 @@ const RETRY_BACKOFF_MS = 2000
 function countWords(text) {
   const trimmed = text.trim()
   return trimmed ? trimmed.split(/\s+/).length : 0
+}
+
+/**
+ * F32 — what to call a "Save as new" copy.
+ *
+ * Two rows with the same name are the one thing a document list must not have:
+ * the whole point of the library is telling them apart. Copying a saved
+ * document therefore marks the copy, while a page that was never saved keeps
+ * the name as typed, and an untouched default hands naming to the server (which
+ * dates it).
+ */
+function copyTitle(title, existingDocumentId) {
+  const base = title.trim()
+  if (!base || base === DEFAULT_TITLE) return null
+  if (!existingDocumentId) return base
+
+  const suffix = ' (copy)'
+  const room = MAX_TITLE_CHARS - suffix.length
+  return `${base.length > room ? base.slice(0, room).trimEnd() : base}${suffix}`
 }
 
 /**
@@ -68,7 +89,7 @@ export default function WritingPage() {
 
   const ready = loadState === 'ready'
 
-  const { dirty, saving, error, lastSavedAt, saveNow, adoptDocument } = useAutosave({
+  const { documentId, dirty, saving, error, lastSavedAt, saveNow, adoptDocument } = useAutosave({
     title,
     content,
     template,
@@ -121,8 +142,6 @@ export default function WritingPage() {
     setAttempt(n => n + 1)
   }, [])
 
-  const checks = useNLP(content, { enabled: ready })
-
   const notepadRef = useRef(null)
 
   // Prediction is about the caret, not the document, so it has to follow the
@@ -131,6 +150,127 @@ export default function WritingPage() {
   const [caret, setCaret] = useState(0)
   const trackCaret = useCallback(event => setCaret(event.target.selectionStart), [])
   const pendingCaretRef = useRef(null)
+
+  /* ── Named documents (F32) ── */
+  const library = useDocuments()
+  const { refresh: refreshLibrary } = library
+  const [libraryOpen, setLibraryOpen] = useState(false)
+  // True while a document is being opened, created or deleted — the editor
+  // content is about to change, so the library's buttons stand down.
+  const [switching, setSwitching] = useState(false)
+
+  const toggleLibrary = useCallback(() => {
+    setLibraryOpen(open => {
+      if (!open) refreshLibrary()
+      return !open
+    })
+  }, [refreshLibrary])
+
+  /** Point the notepad at a document (or at a blank page when given null). */
+  const loadIntoNotepad = useCallback(
+    doc => {
+      const next = doc ?? { id: null, title: DEFAULT_TITLE, content: '', template: null }
+      setTitle(next.title)
+      setContent(next.content)
+      setTemplate(next.template ?? null)
+      setCaret(0)
+      adoptDocument(next)
+    },
+    [adoptDocument]
+  )
+
+  // Anything that replaces what's in the notepad has to get the current work to
+  // the server first — autosave's own tick may be up to 30s away.
+  const flushBeforeSwitching = useCallback(async () => {
+    const saved = await saveNow()
+    if (!saved) {
+      showToast("Couldn't save what's open, so nothing was changed. Try again.", 'error')
+    }
+    return saved
+  }, [saveNow, showToast])
+
+  const openDocument = useCallback(
+    async doc => {
+      if (doc.id === documentId) return
+      setSwitching(true)
+      try {
+        if (!(await flushBeforeSwitching())) return
+        loadIntoNotepad(await library.fetchDocument(doc.id))
+        setLibraryOpen(false)
+        showToast(`Opened “${doc.title}”.`, 'success')
+      } catch (err) {
+        showToast(err?.message || 'Could not open that document.', 'error')
+        refreshLibrary() // it may have been deleted from another tab
+      } finally {
+        setSwitching(false)
+      }
+    },
+    [documentId, flushBeforeSwitching, library, loadIntoNotepad, refreshLibrary, showToast]
+  )
+
+  const startNewDocument = useCallback(async () => {
+    setSwitching(true)
+    try {
+      if (!(await flushBeforeSwitching())) return
+      loadIntoNotepad(null)
+      setLibraryOpen(false)
+      showToast('Started a new document.', 'info')
+    } finally {
+      setSwitching(false)
+    }
+  }, [flushBeforeSwitching, loadIntoNotepad, showToast])
+
+  /** "Save as new" — keep a separate copy and carry on editing that copy. */
+  const saveAsNewDocument = useCallback(async () => {
+    if (!content.trim()) {
+      showToast('Write something first — an empty document has nothing to save.', 'info')
+      return
+    }
+    setSwitching(true)
+    try {
+      // The document being edited keeps whatever it had; only the copy is new.
+      if (!(await flushBeforeSwitching())) return
+      const copy = await library.createDocument({ title: copyTitle(title, documentId), content, template })
+      loadIntoNotepad(copy)
+      await refreshLibrary()
+      showToast(`Saved as “${copy.title}”.`, 'success')
+    } catch (err) {
+      showToast(err?.message || 'Could not save a copy.', 'error')
+    } finally {
+      setSwitching(false)
+    }
+  }, [
+    content,
+    documentId,
+    flushBeforeSwitching,
+    library,
+    loadIntoNotepad,
+    refreshLibrary,
+    showToast,
+    template,
+    title,
+  ])
+
+  const deleteDocument = useCallback(
+    async doc => {
+      setSwitching(true)
+      try {
+        await library.deleteDocument(doc.id)
+        // Deleting what's open would otherwise leave the page saving into a row
+        // that no longer exists; start it on a clean page instead.
+        if (doc.id === documentId) loadIntoNotepad(null)
+        showToast(`Deleted “${doc.title}”.`, 'info')
+      } catch (err) {
+        showToast(err?.message || 'Could not delete that document.', 'error')
+        refreshLibrary()
+      } finally {
+        setSwitching(false)
+      }
+    },
+    [documentId, library, loadIntoNotepad, refreshLibrary, showToast]
+  )
+
+  const checks = useNLP(content, { enabled: ready })
 
   const predictions = useWordPredict(content.slice(0, caret), { enabled: ready })
 
@@ -350,6 +490,21 @@ export default function WritingPage() {
             </div>
           )}
 
+          {/* Document library (F32) */}
+          {libraryOpen && (
+            <DocumentList
+              documents={library.documents}
+              loading={library.loading}
+              error={library.error}
+              currentId={documentId}
+              busy={switching}
+              onOpen={openDocument}
+              onDelete={deleteDocument}
+              onRefresh={refreshLibrary}
+              onClose={() => setLibraryOpen(false)}
+            />
+          )}
+
           {/* Title + save controls */}
           <div className="mb-4 flex flex-wrap items-center gap-3">
             <label className="sr-only" htmlFor="doc-title">
@@ -384,6 +539,48 @@ export default function WritingPage() {
                          focus-visible:outline-blue-500"
             >
               Save now
+            </button>
+          </div>
+
+          {/* Document actions (F32) */}
+          <div className="mb-4 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={toggleLibrary}
+              disabled={!ready}
+              aria-expanded={libraryOpen}
+              className="rounded-xl border border-gray-200 px-4 py-2 text-xs font-bold
+                         text-gray-700 hover:border-gray-300 hover:bg-gray-50
+                         disabled:opacity-50 focus-visible:outline-2
+                         focus-visible:outline-offset-2 focus-visible:outline-blue-500
+                         dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-800"
+            >
+              {libraryOpen ? 'Hide documents' : 'My documents'}
+            </button>
+            <button
+              type="button"
+              onClick={startNewDocument}
+              disabled={!ready || switching}
+              className="rounded-xl border border-gray-200 px-4 py-2 text-xs font-bold
+                         text-gray-700 hover:border-gray-300 hover:bg-gray-50
+                         disabled:opacity-50 focus-visible:outline-2
+                         focus-visible:outline-offset-2 focus-visible:outline-blue-500
+                         dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-800"
+            >
+              New document
+            </button>
+            <button
+              type="button"
+              onClick={saveAsNewDocument}
+              disabled={!ready || switching || !content.trim()}
+              title="Keep a separate copy under its own name"
+              className="rounded-xl border border-gray-200 px-4 py-2 text-xs font-bold
+                         text-gray-700 hover:border-gray-300 hover:bg-gray-50
+                         disabled:opacity-50 focus-visible:outline-2
+                         focus-visible:outline-offset-2 focus-visible:outline-blue-500
+                         dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-800"
+            >
+              Save as new
             </button>
           </div>
 
