@@ -8,7 +8,9 @@ We call bcrypt directly instead — same algorithm, same cost factor, one less
 abandoned dependency.
 """
 
+import hashlib
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
@@ -17,6 +19,16 @@ from jose import JWTError, jwt
 ALGORITHM = "HS256"
 TOKEN_TTL_HOURS = 24
 BCRYPT_ROUNDS = 12  # PRD Section 4: "bcrypt cost 12"
+
+# Long enough to be unguessable, short enough to survive being pasted out of an
+# email client that wraps long lines.
+RESET_TOKEN_BYTES = 32
+# Short by design: a reset link is a live key to the account, and someone who
+# has genuinely just asked for one will use it straight away.
+RESET_TOKEN_TTL_MINUTES = 30
+# A cap on live tokens per account, so /auth/forgot-password can't be used to
+# bury someone's inbox.
+MAX_OUTSTANDING_RESETS = 5
 
 # bcrypt silently truncates at 72 bytes; 5.x raises instead. Truncate explicitly
 # so the behaviour is ours and not the library's.
@@ -58,12 +70,61 @@ def create_access_token(user_id: str) -> str:
 
 def decode_access_token(token: str) -> str | None:
     """Return the user id, or None if the token is invalid/expired/malformed."""
+    claims = decode_token_claims(token)
+    return claims.get("sub") if claims else None
+
+
+def decode_token_claims(token: str) -> dict | None:
+    """Full payload, or None if the token is invalid/expired/malformed."""
     try:
         payload = jwt.decode(token, _secret_key(), algorithms=[ALGORITHM])
     except JWTError:
         return None
-    user_id = payload.get("sub")
-    return user_id if isinstance(user_id, str) else None
+    return payload if isinstance(payload.get("sub"), str) else None
+
+
+def token_predates_password_change(claims: dict, password_changed_at: datetime | None) -> bool:
+    """
+    True when this token was issued before the account's password last changed.
+
+    JWTs are stateless, so a reset cannot delete them; refusing anything older
+    than the change is how a reset ends sessions someone else may be holding.
+
+    Both sides are compared at whole-second resolution because that is all `iat`
+    carries — it is a Unix timestamp, and encoding truncates the fraction away.
+    Comparing a truncated `iat` against a microsecond-precise column would
+    otherwise reject a token issued *after* the reset but inside the same second.
+    """
+    if password_changed_at is None:
+        return False
+    issued_at = claims.get("iat")
+    if issued_at is None:
+        return True  # pre-dates tokens carrying iat at all; treat as stale
+
+    if isinstance(issued_at, datetime):
+        issued = issued_at if issued_at.tzinfo else issued_at.replace(tzinfo=timezone.utc)
+    else:
+        issued = datetime.fromtimestamp(int(issued_at), tz=timezone.utc)
+
+    changed = password_changed_at
+    if changed.tzinfo is None:
+        changed = changed.replace(tzinfo=timezone.utc)  # SQLite hands back naive UTC
+    return issued < changed.replace(microsecond=0)
+
+
+# ── password reset tickets ─────────────────────────────────────────────
+def create_reset_token() -> tuple[str, str, datetime]:
+    """(plaintext token, its hash, expiry). Only the hash is ever stored."""
+    token = secrets.token_urlsafe(RESET_TOKEN_BYTES)
+    expires = datetime.now(timezone.utc) + timedelta(minutes=RESET_TOKEN_TTL_MINUTES)
+    return token, hash_reset_token(token), expires
+
+
+def hash_reset_token(token: str) -> str:
+    """SHA-256, not bcrypt: this is a 256-bit random value, not a guessable
+    secret, so there is nothing for a slow hash to defend against — and the
+    lookup happens on every reset request."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 # ── preferences ────────────────────────────────────────────────────────

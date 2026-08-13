@@ -48,8 +48,44 @@ def get_db():
         db.close()
 
 
+# Columns added to existing tables after the first release. create_all() creates
+# missing *tables* but never missing *columns*, so without this an existing
+# leximind.db would raise "no such column" on every query touching the new field.
+# The PRD's Alembic would own this; with SQLite and one developer, an explicit
+# ADD COLUMN on startup is the honest small version of the same job.
+_ADDED_COLUMNS = {
+    "users": {
+        # Backfilled to the row's creation time: any token older than that
+        # cannot exist, so existing sessions survive the upgrade.
+        "password_changed_at": "DATETIME",
+    },
+}
+
+
+def _add_missing_columns():
+    from sqlalchemy import text
+
+    with engine.begin() as connection:
+        for table, columns in _ADDED_COLUMNS.items():
+            existing = {
+                row[1] for row in connection.execute(text(f"PRAGMA table_info({table})"))
+            }
+            if not existing:
+                continue  # table isn't there yet; create_all just made it correctly
+            for column, ddl in columns.items():
+                if column in existing:
+                    continue
+                connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+                if table == "users" and column == "password_changed_at":
+                    connection.execute(
+                        text("UPDATE users SET password_changed_at = created_at")
+                    )
+
+
 def init_db():
-    """Create any missing tables. Safe to call on every startup."""
+    """Create any missing tables and columns. Safe to call on every startup."""
     from backend import models  # noqa: F401 — registers models on Base.metadata
 
     Base.metadata.create_all(bind=engine)
+    if DATABASE_URL.startswith("sqlite"):
+        _add_missing_columns()

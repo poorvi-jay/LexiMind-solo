@@ -1,14 +1,21 @@
 """
 backend/routers/auth.py
 F01 registration · F02 login + session persistence · F03 preferences storage
-F04 preference updates
+F04 preference updates · password reset
 
 Endpoints: POST /auth/register, POST /auth/login, GET /auth/me,
-           PATCH /auth/preferences
+           PATCH /auth/preferences, POST /auth/forgot-password,
+           GET /auth/reset-password/{token}, POST /auth/reset-password
+
+The reset flow never reveals whether an email is registered. /auth/forgot-password
+answers the same way for an unknown address as for a real one, because a
+different answer would turn it into a way to test which emails have accounts.
 """
 
+import os
 from datetime import datetime, timezone
 from typing import Literal
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
@@ -16,8 +23,8 @@ from sqlalchemy.orm import Session
 
 from backend.database import get_db
 from backend.dependencies import get_current_user
-from backend.models import User
-from backend.services import auth_service
+from backend.models import PasswordResetToken, User
+from backend.services import auth_service, mailer
 
 router = APIRouter()
 
@@ -72,6 +79,28 @@ class AuthResponse(BaseModel):
     user: UserOut
 
 
+class ForgotPasswordRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=16, max_length=256)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class StatusOut(BaseModel):
+    status: str
+    message: str
+
+
+class ResetLinkCheck(BaseModel):
+    valid: bool
+
+
 def _serialize(user: User) -> UserOut:
     """password_hash is never included — PRD Section 4."""
     return UserOut(
@@ -119,6 +148,115 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
     db.refresh(user)
 
     return AuthResponse(access_token=auth_service.create_access_token(user.id), user=_serialize(user))
+
+
+# ── password reset ─────────────────────────────────────────────────────
+def _reset_link(token: str) -> str:
+    """The page the writer lands on. APP_BASE_URL lets a deployment override it."""
+    base = os.getenv("APP_BASE_URL", "http://localhost:5173").rstrip("/")
+    return f"{base}/auth/reset?token={quote(token)}"
+
+
+def _live_token(db: Session, token: str) -> PasswordResetToken | None:
+    """The row for this token if it is still redeemable, else None."""
+    row = (
+        db.query(PasswordResetToken)
+        .filter(PasswordResetToken.token_hash == auth_service.hash_reset_token(token))
+        .first()
+    )
+    if row is None or row.used_at is not None:
+        return None
+
+    expires = row.expires_at
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)  # SQLite returns naive UTC
+    return row if expires > datetime.now(timezone.utc) else None
+
+
+@router.post("/auth/forgot-password", response_model=StatusOut)
+def forgot_password(req: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    """Send a reset link, if that address has an account.
+
+    Always answers the same way. An unknown address, an account at its
+    outstanding-token cap, and a mail server that is down all produce this exact
+    response, so nothing here can be used to find out who has an account.
+    """
+    answer = StatusOut(
+        status="ok",
+        message="If that email has an account, a reset link is on its way.",
+    )
+
+    email = req.email.strip().lower()
+    user = db.query(User).filter(User.email == email).first()
+    if user is None:
+        return answer
+
+    now = datetime.now(timezone.utc)
+    outstanding = (
+        db.query(PasswordResetToken)
+        .filter(
+            PasswordResetToken.user_id == user.id,
+            PasswordResetToken.used_at.is_(None),
+            PasswordResetToken.expires_at > now,
+        )
+        .count()
+    )
+    if outstanding >= auth_service.MAX_OUTSTANDING_RESETS:
+        return answer
+
+    token, token_hash, expires_at = auth_service.create_reset_token()
+    db.add(PasswordResetToken(user_id=user.id, token_hash=token_hash, expires_at=expires_at))
+    db.commit()
+
+    mailer.send(
+        to=user.email,
+        subject="Reset your LexiMind password",
+        body=(
+            f"Hi {user.name},\n\n"
+            "You asked to reset your LexiMind password. Open this link to choose "
+            f"a new one:\n\n{_reset_link(token)}\n\n"
+            f"The link works once and expires in "
+            f"{auth_service.RESET_TOKEN_TTL_MINUTES} minutes.\n\n"
+            "If you didn't ask for this, you can ignore this email — your "
+            "password stays as it is.\n"
+        ),
+    )
+    return answer
+
+
+@router.get("/auth/reset-password/{token}", response_model=ResetLinkCheck)
+def check_reset_link(token: str, db: Session = Depends(get_db)):
+    """Whether a link is still good, so the page can say so before anything is typed."""
+    return ResetLinkCheck(valid=_live_token(db, token) is not None)
+
+
+@router.post("/auth/reset-password", response_model=StatusOut)
+def reset_password(req: ResetPasswordRequest, db: Session = Depends(get_db)):
+    """Set a new password and end every session that was open before now."""
+    row = _live_token(db, req.token)
+    if row is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "That reset link has expired or has already been used. Please request a new one.",
+        )
+
+    user = db.get(User, row.user_id)
+    if user is None:  # account deleted between request and redemption
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "That reset link is no longer valid.")
+
+    now = datetime.now(timezone.utc)
+    user.password_hash = auth_service.hash_password(req.password)
+    user.password_changed_at = now
+    row.used_at = now
+
+    # Any other link that was still out there is now void: whoever prompted this
+    # reset must not be able to redeem an earlier one they also requested.
+    for other in user.reset_tokens:
+        if other.id != row.id and other.used_at is None:
+            other.used_at = now
+
+    db.commit()
+    return StatusOut(status="reset", message="Your password has been changed. You can log in now.")
 
 
 @router.get("/auth/me", response_model=UserOut)

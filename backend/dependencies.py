@@ -34,12 +34,16 @@ def get_current_user(
     if credentials is None or not credentials.credentials:
         raise _UNAUTHENTICATED
 
-    user_id = auth_service.decode_access_token(credentials.credentials)
-    if user_id is None:
+    claims = auth_service.decode_token_claims(credentials.credentials)
+    if claims is None:
         raise _UNAUTHENTICATED
 
-    user = db.get(User, user_id)
+    user = db.get(User, claims["sub"])
     if user is None:
         raise _UNAUTHENTICATED  # token signed for a since-deleted account
+
+    # A password reset ends every session that was open before it.
+    if auth_service.token_predates_password_change(claims, user.password_changed_at):
+        raise _UNAUTHENTICATED
 
     return user

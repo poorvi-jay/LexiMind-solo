@@ -44,6 +44,10 @@ class User(Base):
     password_hash = Column(String(255), nullable=False)  # bcrypt cost 12, never returned via API
     created_at = Column(DateTime, nullable=False, default=_utcnow)
     last_active = Column(DateTime, nullable=False, default=_utcnow)
+    # Set whenever the password changes. Access tokens issued before this moment
+    # are refused, so a password reset actually ends whatever sessions were open
+    # — which is the point of resetting it when someone else has your account.
+    password_changed_at = Column(DateTime, nullable=False, default=_utcnow)
 
     # ── preferences (PRD 4: pref_* columns) ────────────────────────────
     pref_font = Column(String(50), nullable=False, default="Lexend")
@@ -64,6 +68,9 @@ class User(Base):
     writing_sessions = relationship(
         "WritingSession", back_populates="user", cascade="all, delete-orphan"
     )
+    reset_tokens = relationship(
+        "PasswordResetToken", back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class SavedDocument(Base):
@@ -82,6 +89,28 @@ class SavedDocument(Base):
     updated_at = Column(DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
 
     user = relationship("User", back_populates="documents")
+
+
+class PasswordResetToken(Base):
+    """A single-use, expiring ticket to set a new password.
+
+    Only the SHA-256 of the token is stored. The plaintext exists just long
+    enough to be put in the reset link, so a copy of this table is not a set of
+    working reset links — the same reason `password_hash` is a hash.
+    """
+
+    __tablename__ = "password_reset_tokens"
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    user_id = Column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token_hash = Column(String(64), unique=True, nullable=False, index=True)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)  # set on redemption; never reusable
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+
+    user = relationship("User", back_populates="reset_tokens")
 
 
 class WritingSession(Base):

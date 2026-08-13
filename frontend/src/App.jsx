@@ -4,6 +4,7 @@ import AuthPage from './pages/AuthPage.jsx'
 import HomePage from './pages/HomePage.jsx'
 import NavBar from './components/NavBar.jsx'
 import ReadingPage from './pages/ReadingPage.jsx'
+import ResetPasswordPage from './pages/ResetPasswordPage.jsx'
 import SettingsPage from './pages/SettingsPage.jsx'
 import WritingPage from './pages/WritingPage.jsx'
 import { useAuthContext } from './context/AuthContext.jsx'
@@ -40,6 +41,8 @@ export default function App() {
       <NavBar />
       <Routes>
         <Route path="/auth" element={<AuthPage />} />
+        {/* Public: whoever follows a reset link is by definition locked out. */}
+        <Route path="/auth/reset" element={<ResetPasswordPage />} />
         <Route path="/" element={<HomePage />} />
         <Route path="/reading" element={<RequireAuth><ReadingPage /></RequireAuth>} />
         <Route path="/writing" element={<RequireAuth><WritingPage /></RequireAuth>} />

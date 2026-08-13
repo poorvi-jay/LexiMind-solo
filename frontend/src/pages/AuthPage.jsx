@@ -1,16 +1,20 @@
 import { useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 
+import { api } from '../utils/api'
 import { useAuthContext } from '../context/AuthContext.jsx'
 
 const MIN_PASSWORD_LENGTH = 8 // must match backend/routers/auth.py
 
 export default function AuthPage() {
-  const [mode, setMode] = useState('login') // 'login' | 'register'
+  // 'forgot' is not a peer of the other two — it is a detour off the login
+  // form, so the tab strip is hidden while it is showing.
+  const [mode, setMode] = useState('login') // 'login' | 'register' | 'forgot'
   const [name, setName] = useState('')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
   const { login, register, isAuthenticated } = useAuthContext()
@@ -27,11 +31,31 @@ export default function AuthPage() {
   const switchMode = next => {
     setMode(next)
     setError('')
+    setNotice('')
   }
 
   const handleSubmit = async event => {
     event.preventDefault()
     setError('')
+
+    if (mode === 'forgot') {
+      if (!email.trim()) {
+        setError('Please enter the email you signed up with.')
+        return
+      }
+      setSubmitting(true)
+      try {
+        const { message } = await api.post('/auth/forgot-password', { email: email.trim() })
+        // Deliberately the same message whether or not that address has an
+        // account — the server answers identically, and so does the page.
+        setNotice(message)
+      } catch (err) {
+        setError(err.message || 'Could not send a reset link. Please try again.')
+      } finally {
+        setSubmitting(false)
+      }
+      return
+    }
 
     if (mode === 'register' && !name.trim()) {
       setError('Please enter your name.')
@@ -64,44 +88,48 @@ export default function AuthPage() {
     <main className="mx-auto flex max-w-md flex-col gap-6 px-6 py-12">
       <header className="text-center">
         <h1 className="text-2xl font-semibold text-gray-950 dark:text-white">
-          {mode === 'login' ? 'Welcome back' : 'Create your account'}
+          {{ login: 'Welcome back', register: 'Create your account', forgot: 'Reset your password' }[mode]}
         </h1>
         <p className="mt-2 text-sm text-gray-500 dark:text-gray-400">
-          {mode === 'login'
-            ? 'Sign in to reach your reading tools and saved settings.'
-            : 'Your reading preferences follow you across every device.'}
+          {{
+            login: 'Sign in to reach your reading tools and saved settings.',
+            register: 'Your reading preferences follow you across every device.',
+            forgot: 'Enter your email and we will send you a link to set a new password.',
+          }[mode]}
         </p>
       </header>
 
       {/* ── Login / Register tabs ── */}
-      <div
-        className="flex rounded-full border border-gray-200 bg-gray-50 p-1
-                   dark:border-gray-800 dark:bg-[#2A2A2A]"
-        role="tablist"
-        aria-label="Authentication mode"
-      >
-        {[
-          { key: 'login', label: 'Log in' },
-          { key: 'register', label: 'Sign up' },
-        ].map(tab => (
-          <button
-            key={tab.key}
-            type="button"
-            role="tab"
-            aria-selected={mode === tab.key}
-            onClick={() => switchMode(tab.key)}
-            className={`flex-1 rounded-full px-4 py-2 text-sm font-medium transition-colors
-              focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500
-              ${
-                mode === tab.key
-                  ? 'bg-white text-blue-700 shadow-sm dark:bg-gray-800 dark:text-blue-200'
-                  : 'text-gray-500 hover:text-gray-900 dark:text-gray-300 dark:hover:text-white'
-              }`}
-          >
-            {tab.label}
-          </button>
-        ))}
-      </div>
+      {mode !== 'forgot' && (
+        <div
+          className="flex rounded-full border border-gray-200 bg-gray-50 p-1
+                     dark:border-gray-800 dark:bg-[#2A2A2A]"
+          role="tablist"
+          aria-label="Authentication mode"
+        >
+          {[
+            { key: 'login', label: 'Log in' },
+            { key: 'register', label: 'Sign up' },
+          ].map(tab => (
+            <button
+              key={tab.key}
+              type="button"
+              role="tab"
+              aria-selected={mode === tab.key}
+              onClick={() => switchMode(tab.key)}
+              className={`flex-1 rounded-full px-4 py-2 text-sm font-medium transition-colors
+                focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500
+                ${
+                  mode === tab.key
+                    ? 'bg-white text-blue-700 shadow-sm dark:bg-gray-800 dark:text-blue-200'
+                    : 'text-gray-500 hover:text-gray-900 dark:text-gray-300 dark:hover:text-white'
+                }`}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+      )}
 
       <form onSubmit={handleSubmit} className="flex flex-col gap-4" noValidate>
         {mode === 'register' && (
@@ -143,6 +171,7 @@ export default function AuthPage() {
           />
         </div>
 
+        {mode !== 'forgot' && (
         <div>
           <label
             htmlFor="auth-password"
@@ -170,6 +199,17 @@ export default function AuthPage() {
             </p>
           )}
         </div>
+        )}
+
+        {notice && (
+          <p
+            role="status"
+            className="rounded-xl bg-green-50 px-4 py-3 text-sm text-green-800
+                       dark:bg-green-950/40 dark:text-green-200"
+          >
+            {notice}
+          </p>
+        )}
 
         {error && (
           <p
@@ -191,10 +231,32 @@ export default function AuthPage() {
         >
           {submitting
             ? 'Please wait…'
-            : mode === 'login'
-              ? 'Log in'
-              : 'Create account'}
+            : { login: 'Log in', register: 'Create account', forgot: 'Send reset link' }[mode]}
         </button>
+
+        {mode === 'login' && (
+          <button
+            type="button"
+            onClick={() => switchMode('forgot')}
+            className="self-center text-sm font-medium text-blue-700 underline
+                       focus-visible:outline-2 focus-visible:outline-offset-2
+                       focus-visible:outline-blue-500 dark:text-blue-300"
+          >
+            Forgot your password?
+          </button>
+        )}
+
+        {mode === 'forgot' && (
+          <button
+            type="button"
+            onClick={() => switchMode('login')}
+            className="self-center text-sm font-medium text-blue-700 underline
+                       focus-visible:outline-2 focus-visible:outline-offset-2
+                       focus-visible:outline-blue-500 dark:text-blue-300"
+          >
+            Back to log in
+          </button>
+        )}
       </form>
     </main>
   )
