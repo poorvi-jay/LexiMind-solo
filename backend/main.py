@@ -1,10 +1,21 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import logging
 import os
 import threading
 from pathlib import Path
 from dotenv import load_dotenv
+
+# Nothing configured logging before, so the root logger sat at its WARNING
+# default with no handler: every logger.info() in backend/services was dropped,
+# including the lines that confirm LanguageTool and DistilGPT-2 finished loading.
+# Install a handler at WARNING for the world, and lift just our own tree to INFO
+# so transformers and friends don't fill the console. The level is checked at the
+# originating logger, so backend.* records reach the root handler regardless of
+# root's own level.
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s [%(name)s] %(message)s")
+logging.getLogger("backend").setLevel(logging.INFO)
 
 # Explicit path so .env loads regardless of the process's working directory
 load_dotenv(Path(__file__).resolve().parent / ".env")
@@ -69,4 +80,37 @@ app.include_router(writing_router, tags=["Writing"])
 app.include_router(nlp_router, tags=["NLP"])
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "5.0"}
+    """
+    Liveness plus per-model readiness (M2 build guide §3.2 and §4.1).
+
+    `status` stays "ok" whenever the API is serving, so a deploy health check
+    keyed on it doesn't start failing the moment a model is slow or Java is
+    missing — the app is up and every endpoint still answers. Readiness is a
+    separate question and lives under `models`, each entry being:
+
+        ready       usable now
+        loading     still warming; ask again shortly
+        unavailable will not work in this process (no Java, download failed…)
+
+    The split matters to the writing page: 'loading' is a "Loading…" state worth
+    waiting on, 'unavailable' is a permanent note to show instead. Nothing here
+    takes a warm-up lock, so this answers immediately during startup — which is
+    exactly when it gets asked.
+    """
+    models = {
+        # F26-F28. spaCy gates all three checks, so this is the one signal.
+        "checks": nlp_service.checks_readiness(),
+        # F27. Needs a local Java install; see requirements.txt.
+        "grammar": nlp_service.grammar_readiness(),
+        # F29. DistilGPT-2, ~350MB on first run.
+        "prediction": prediction_service.readiness(),
+    }
+    return {
+        "status": "ok",
+        "version": "5.0",
+        "models": models,
+        # True once nothing is still warming. Something 'unavailable' does not
+        # hold this back — it is never going to arrive, and a client waiting on
+        # it would wait forever.
+        "warm": all(state != "loading" for state in models.values()),
+    }

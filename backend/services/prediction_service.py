@@ -152,6 +152,23 @@ def status() -> tuple[bool, str | None]:
     return False, "Word prediction is still starting up."
 
 
+def readiness() -> str:
+    """
+    'ready' | 'loading' | 'unavailable' for DistilGPT-2. Never blocks.
+
+    Reads the globals directly rather than taking _load_lock, so /health answers
+    immediately while the ~350MB model is still downloading — which is the whole
+    point of asking.
+
+    This describes the model only. Mid-word completion runs off the prefix
+    vocabulary and keeps working without it, so 'unavailable' here means the
+    word-boundary pills are gone, not that /nlp/predict fails.
+    """
+    if _model is not None:
+        return "ready"
+    return "unavailable" if _load_error is not None else "loading"
+
+
 def _complete_prefix(prefix: str) -> list[str]:
     """Most common real words starting with `prefix` (F29, mid-word case)."""
     lowered = prefix.lower()

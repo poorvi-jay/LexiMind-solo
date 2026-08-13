@@ -334,6 +334,31 @@ def grammar_status() -> tuple[bool, str | None]:
     return False, "Grammar checking is still starting up."
 
 
+def _readiness(resource, error) -> str:
+    """
+    'ready' | 'loading' | 'unavailable', from a resource and its recorded error.
+
+    The distinction the status tuples above can't express is the one /health
+    needs: "not yet" and "never" are both `available: False`, but a client
+    should wait on the first and stop asking on the second. Every loader here
+    records its failure instead of raising, so a set error means the attempt is
+    over — nothing retries within a process.
+    """
+    if resource is not None:
+        return "ready"
+    return "unavailable" if error is not None else "loading"
+
+
+def checks_readiness() -> str:
+    """Whether the spaCy-backed checks (F26-F28) can run. Never blocks."""
+    return _readiness(_spacy_nlp, _spacy_error)
+
+
+def grammar_readiness() -> str:
+    """Whether LanguageTool (F27) can run. Never blocks."""
+    return _readiness(_language_tool, _language_tool_error)
+
+
 def warm_up() -> None:
     """
     Build every cached resource. Called once at startup, off the event loop.
@@ -346,6 +371,17 @@ def warm_up() -> None:
         _get_phonetic_index()
         _get_spacy()
         _get_language_tool()
+
+    # Both loaders are silent on success, so without this the only way to tell
+    # LanguageTool finished is to make a request and read grammar_available.
+    # Outside the lock: the readiness helpers don't take it.
+    # Plain ASCII: this lands on a cp1252 console on Windows, where an em dash
+    # comes out as a replacement character.
+    logger.info(
+        "Writing checks warmed up - checks: %s, grammar: %s",
+        checks_readiness(),
+        grammar_readiness(),
+    )
 
 
 # ── F26 · phonetic spell correction ────────────────────────────────────
