@@ -64,6 +64,11 @@ class PredictRequest(BaseModel):
 
 class PredictResponse(BaseModel):
     words: list[str]      # up to three single-word pills (F29)
+    available: bool
+    unavailable_reason: str | None = None
+
+
+class PhraseResponse(BaseModel):
     phrase: str           # a longer completion, "" when there isn't a good one
     available: bool
     unavailable_reason: str | None = None
@@ -78,10 +83,19 @@ def check(req: CheckRequest, current_user: User = Depends(get_current_user)):
 @router.post("/nlp/predict", response_model=PredictResponse)
 def predict(req: PredictRequest, current_user: User = Depends(get_current_user)):
     """
-    F29 + v5.0 — what could come next at the caret.
+    F29 — the three word pills for the caret. The fast half (~130ms).
 
     Never fails: prediction_service swallows its own errors and returns empty
     results, because a suggestion that can't be produced is not worth turning a
     keystroke into an error.
     """
     return prediction_service.predict(req.text)
+
+
+@router.post("/nlp/predict/phrase", response_model=PhraseResponse)
+def predict_phrase(req: PredictRequest, current_user: User = Depends(get_current_user)):
+    """
+    v5.0 — the phrase completion. The slow half (~1.5s), kept off the pills'
+    path so typing never waits on it. Same request shape as /nlp/predict.
+    """
+    return prediction_service.predict_phrase(req.text)

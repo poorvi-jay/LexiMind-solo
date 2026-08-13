@@ -9,10 +9,17 @@ import { api } from '../utils/api'
  */
 export const PREDICT_DEBOUNCE_MS = 250
 
+/**
+ * v5.0 — the phrase is a separate, much slower request (~1.5s of model time
+ * against ~130ms for the pills), so it waits for a real pause in typing rather
+ * than firing on the same beat as the pills. Nothing on screen is held up by
+ * it: the pills land on their own debounce and the phrase appears when it is
+ * ready.
+ */
+export const PHRASE_DEBOUNCE_MS = 900
+
 /** Matches MAX_CHECK_CHARS in backend/services/nlp_service.py. */
 const MAX_CONTEXT_CHARS = 10_000
-
-const EMPTY = { words: [], phrase: '' }
 
 /**
  * Word and phrase suggestions for the caret position.
@@ -25,51 +32,91 @@ const EMPTY = { words: [], phrase: '' }
  * replace the suggestions for a position the writer has already left.
  */
 export function useWordPredict(context, { enabled = true } = {}) {
-  const [suggestions, setSuggestions] = useState(EMPTY)
+  const [words, setWords] = useState([])
   const [predicting, setPredicting] = useState(false)
   const [available, setAvailable] = useState(true)
+  // Kept with the context it was produced for. The phrase arrives up to a
+  // second and a half after the pills, and a phrase that completes a sentence
+  // the writer has already moved past is worse than no phrase, so it is matched
+  // on read rather than cleared by an effect.
+  const [phraseResult, setPhraseResult] = useState({ context: null, phrase: '' })
 
-  const requestRef = useRef(0)
+  const wordRequest = useRef(0)
+  const phraseRequest = useRef(0)
 
+  const usable = enabled && Boolean(context.trim()) && context.length <= MAX_CONTEXT_CHARS
+
+  /* ── the pills (fast) ── */
   useEffect(() => {
     if (!enabled) return
 
     const timer = setTimeout(() => {
-      // Nothing to predict from, and nothing worth a request.
-      if (!context.trim() || context.length > MAX_CONTEXT_CHARS) {
-        requestRef.current += 1 // cancel anything in flight
-        setSuggestions(EMPTY)
+      if (!usable) {
+        wordRequest.current += 1 // cancel anything in flight
+        setWords([])
         return
       }
 
-      const requestId = requestRef.current + 1
-      requestRef.current = requestId
+      const requestId = wordRequest.current + 1
+      wordRequest.current = requestId
       setPredicting(true)
 
       api
         .post('/nlp/predict', { text: context })
         .then(data => {
-          if (requestRef.current !== requestId) return // superseded
-          setSuggestions({ words: data.words || [], phrase: data.phrase || '' })
+          if (wordRequest.current !== requestId) return // superseded
+          setWords(data.words || [])
           setAvailable(Boolean(data.available))
         })
         .catch(() => {
-          if (requestRef.current !== requestId) return
+          if (wordRequest.current !== requestId) return
           // Prediction is a convenience; a failure just means no pills.
-          setSuggestions(EMPTY)
+          setWords([])
         })
         .finally(() => {
-          if (requestRef.current === requestId) setPredicting(false)
+          if (wordRequest.current === requestId) setPredicting(false)
         })
     }, PREDICT_DEBOUNCE_MS)
 
     return () => clearTimeout(timer)
-  }, [context, enabled])
+  }, [context, enabled, usable])
+
+  /* ── the phrase (slow, on a pause) ── */
+  useEffect(() => {
+    if (!enabled || !usable) return
+
+    const timer = setTimeout(() => {
+      const requestId = phraseRequest.current + 1
+      phraseRequest.current = requestId
+
+      api
+        .post('/nlp/predict/phrase', { text: context })
+        .then(data => {
+          if (phraseRequest.current !== requestId) return // superseded
+          setPhraseResult({ context, phrase: data.phrase || '' })
+        })
+        .catch(() => {
+          if (phraseRequest.current !== requestId) return
+          setPhraseResult({ context, phrase: '' })
+        })
+    }, PHRASE_DEBOUNCE_MS)
+
+    return () => clearTimeout(timer)
+  }, [context, enabled, usable])
 
   const clear = useCallback(() => {
-    requestRef.current += 1
-    setSuggestions(EMPTY)
+    wordRequest.current += 1
+    phraseRequest.current += 1
+    setWords([])
+    setPhraseResult({ context: null, phrase: '' })
   }, [])
 
-  return { ...suggestions, predicting, available, clear }
+  return {
+    words,
+    // Only ever the phrase for the text that is actually in front of the caret.
+    phrase: phraseResult.context === context ? phraseResult.phrase : '',
+    predicting,
+    available,
+    clear,
+  }
 }

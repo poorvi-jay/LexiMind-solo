@@ -49,6 +49,30 @@ MAX_SUGGESTIONS = 3
 # Size of the candidate pool the phonetic index is built from.
 SUGGESTION_VOCAB_SIZE = 60_000
 
+# Shorthand that is technically a word but almost never the intended one.
+#
+# Frequency can't catch these and no threshold will: they are *common* precisely
+# because people write them ("cuz" sits at zipf 3.89, above plenty of ordinary
+# vocabulary), and several are real dictionary headwords, so both halves of the
+# validity test wave them through. "cud" is the one the acceptance criteria name
+# — a cow chews the cud, but a student writing "I cud not find my bag" meant
+# "could".
+#
+# Kept deliberately short, and only for forms whose legitimate use is rare in
+# prose. "cos" (cosine) and "thru" (drive-thru) are left out for exactly that
+# reason. The result is advice, not a correction: the writer can ignore it.
+INTENDED_WORDS = {
+    "cud": "could",
+    "wud": "would",
+    "cuz": "because",
+    "gud": "good",
+    "wat": "what",
+    "wen": "when",
+    "dat": "that",
+    "dis": "this",
+    "tho": "though",
+}
+
 # ── homophones (F28) ───────────────────────────────────────────────────
 # Rule-based and deliberately conservative: a word is only flagged when its
 # grammatical context actually looks wrong, never merely for being confusable.
@@ -74,6 +98,25 @@ TOO_ADJECTIVES = {
     "young", "heavy", "light", "expensive", "cheap", "tired", "busy",
 }
 DETERMINERS = {"the", "a", "an", "this", "that", "these", "those", "any", "no"}
+# Words that complete "you're …" / "they're …" / "it's …" but are almost never
+# something a person owns. The parse cannot make this call: spaCy reads the word
+# after a possessive as a noun, so "Your late." and "Your turn." come back with
+# identical tags (poss → NOUN → ROOT). Only the word itself separates them.
+#
+# Used together with the finite-verb test, never alone — "Your late father would
+# be proud" has a verb of its own and stays clean, while "Your late again today"
+# has none. Words with a strong possessive sense of their own (right, best,
+# first, kind, turn) are deliberately absent.
+PREDICATE_ADJECTIVES = {
+    "late", "welcome", "ready", "sure", "early", "correct", "wrong", "safe",
+    "done", "finished", "invited", "allowed", "awesome", "amazing", "great",
+    "brilliant", "wonderful", "terrible", "silly", "crazy", "funny", "lucky",
+    "sorry", "hilarious", "annoying", "beautiful", "gorgeous", "smart",
+}
+# Adjectives that act as nouns after a possessive — "do your best", "your own
+# room", "at their worst". These are the exception to "a possessive never heads
+# an adjective", so that rule has to stand down for them.
+NOMINALISED_ADJECTIVES = {"best", "worst", "own", "all", "utmost", "most", "least"}
 
 
 # ── lazily built resources ─────────────────────────────────────────────
@@ -117,8 +160,12 @@ def is_real_word(word: str) -> bool:
     wordfreq's frequency list contains plenty of them ("recieve" is common
     enough on the web to rank). Reusing this keeps one definition of what
     counts as a real word instead of two that can drift apart.
+
+    INTENDED_WORDS is excluded here too, so prediction can't offer a form the
+    spell checker would immediately underline — "cuz" outranks plenty of
+    ordinary vocabulary and would otherwise surface as a pill.
     """
-    return _is_valid_word(word)
+    return word not in INTENDED_WORDS and _is_valid_word(word)
 
 
 def _get_phonetic_index() -> dict:
@@ -342,6 +389,19 @@ def _spelling_issues(doc) -> list[dict]:
             continue
 
         lower = token.text.lower()
+        # Checked before the validity test, which these would otherwise pass.
+        if lower in INTENDED_WORDS:
+            meant = INTENDED_WORDS[lower]
+            issues.append({
+                "type": "spelling",
+                "start": token.idx,
+                "end": token.idx + len(token.text),
+                "text": token.text,
+                "message": f'Did you mean "{meant}"?',
+                "suggestions": [meant],
+            })
+            continue
+
         if _is_valid_word(lower):
             continue
         # Inflections fall through the frequency and dictionary tests together
@@ -392,13 +452,31 @@ def _homophone_verdict(doc, token):
             and has_finite_verb
         )
 
+        # "Your late." / "You're welcome." — a possessive in front of a
+        # predicate adjective, in a sentence carrying no finite verb of its own.
+        # Both halves are load-bearing: without the word list this fires on
+        # "Your turn.", and without the verb test it fires on "Your late father
+        # would be proud."
+        predicate_fragment = (
+            nxt is not None and nxt.lower_ in PREDICATE_ADJECTIVES and not has_finite_verb
+        )
+
+        # "Your the best" — nothing may sit between a possessive and its noun,
+        # so a determiner straight after it means the possessive is wrong.
+        determiner_after = nxt is not None and nxt.pos_ == "DET"
+        # "Do your best" — the one place a possessive legitimately heads an
+        # adjective, so the rule below has to let it through.
+        nominalised = nxt is not None and nxt.lower_ in NOMINALISED_ADJECTIVES
+
         # Unambiguous: a real possessive always heads a noun, so these never
         # fire on "their running shoes" and must not defer to the guard above.
         strong = (
-            # "Your late" — modifying an adjective or verb outright
-            token.head.pos_ in {"VERB", "AUX", "ADJ"}
+            determiner_after
+            # "Your going" — modifying a verb or adjective outright
+            or (token.head.pos_ in {"VERB", "AUX", "ADJ"} and not nominalised)
             # "Their going home and I lost my phone" — parsed as the subject
             or token.dep_ == "nsubj"
+            or predicate_fragment
         )
         # Ambiguous: both the mistake and a genuine gerund modifier put an -ing
         # word after the possessive, so only these defer to gerund_modifier.

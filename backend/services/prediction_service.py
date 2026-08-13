@@ -14,9 +14,12 @@ Two different jobs, deliberately answered by two different mechanisms:
   - **At a word boundary** ("I went to the |") the writer wants to know what
     comes next, which is a language-model question, so DistilGPT-2 answers it.
 
-Both the three word pills and the phrase come out of a single generate() call:
-its first-step scores give the next-word candidates and its output gives the
-phrase, which costs one model pass (~0.45s) instead of two (~0.6s).
+The pills and the phrase are served by **two separate entry points**, because
+they cost wildly different amounts. The pills need only the next-word
+distribution, which is one forward pass (~130ms); the phrase needs a real
+continuation (~1.5s on this CPU) and is roughly 90% of the work. Producing both
+together made every keystroke wait on the slow half, so predict() answers with
+pills alone and predict_phrase() is called separately, on a longer pause.
 
 Nothing here raises. A prediction that fails is not worth failing a keystroke
 over, so every entry point degrades to empty results and the bar just stays
@@ -38,8 +41,19 @@ MODEL_NAME = "distilgpt2"
 CONTEXT_CHARS = 400
 
 WORD_SUGGESTIONS = 3      # F29: three single-word pills
-PHRASE_TOKENS = 8         # roughly a short clause
+# The pills only need the next-word distribution, which is the first generation
+# step — one forward pass rather than a full continuation.
+WORD_STEP_TOKENS = 1
+# Enough material to trim back to a finished thought. Measured across 17
+# realistic contexts: 10 tokens produces the same phrases as 20 (the model
+# usually closes a sentence well before the cap) at half the time, while the
+# old budget of 8 rarely left enough to trim and still say anything.
+PHRASE_TOKENS = 12
 TOP_K = 60                # candidate next-tokens to filter down to whole words
+
+# A phrase is worth offering only if it reads as a finished piece of writing.
+PHRASE_MIN_WORDS = 3
+PHRASE_MAX_WORDS = 10
 
 # Below this a prefix matches so much of the vocabulary that the ranking is
 # meaningless — "a" would just return the most common words in English.
@@ -59,7 +73,27 @@ _TRAILING_WORD = re.compile(r"[A-Za-z']+$")
 # The model happily drifts into a new paragraph or a quotation; the phrase pill
 # should stop at the end of the current thought.
 _PHRASE_STOP = re.compile(r'[\n\r"“”]')
-_SENTENCE_END = re.compile(r"[.!?]$")
+_SENTENCE_END = re.compile(r"[.!?]")
+
+# A continuation that begins with a contraction tail would be inserted after a
+# space — "and he 's a very good guy" — so it is not worth offering.
+_CONTRACTION_START = re.compile(r"^'(s|t|re|ll|d|ve|m)\b", re.I)
+
+# DistilGPT-2 is trained on scraped web text, and on school-shaped prompts it
+# volunteers things a writing aid for children must not put on screen — a real
+# measured example was "In conclusion, the experiment showed that" completing to
+# "a single dose of cannabis was associated with increased". This is not content
+# moderation, just a floor: any phrase touching one of these is dropped, and the
+# pill simply doesn't appear.
+_UNSUITABLE = frozenset({
+    "cannabis", "cocaine", "heroin", "marijuana", "weed", "drug", "drugs",
+    "alcohol", "drunk", "beer", "vodka", "whisky", "cigarette", "cigarettes",
+    "smoking", "vape", "sex", "sexual", "sexy", "porn", "nude", "naked",
+    "rape", "raped", "murder", "murdered", "kill", "killed", "killing",
+    "suicide", "gun", "guns", "shot", "shooting", "stabbed", "kidnapped",
+    "abuse", "abused", "terrorist", "bomb", "damn", "hell", "shit", "fuck",
+    "bitch", "bastard", "gambling", "casino", "betting",
+})
 
 
 def _get_prefix_vocab() -> list[str]:
@@ -133,39 +167,55 @@ def _complete_prefix(prefix: str) -> list[str]:
     return out
 
 
+def _bare(word: str) -> str:
+    """A word with its punctuation stripped, for looking up in the word sets."""
+    return re.sub(r"[^\w']", "", word).lower()
+
+
 def _clean_phrase(raw: str) -> str:
     """
-    Trim a raw continuation into something safe to insert.
+    Turn a raw continuation into a finished sentence, or into nothing.
 
-    Returns "" rather than anything doubtful — a bad phrase pill is worse than
-    no phrase pill, and the UI only shows it when it is non-empty.
+    **Only a completed sentence is offered.** Measured across 17 realistic
+    contexts, that one rule separates the good phrases from the bad ones
+    exactly: every completion that reached a full stop read as writing ("had to
+    go back and get it.", "using a variety of ingredients."), and every one that
+    ran out of tokens first read as a fragment ("I was going to be in the
+    middle", "dissolved it in a liquid solution, then used"). Trimming the
+    fragments back word by word was tried first and could not save them — what
+    is missing is the rest of the thought, not the last word.
+
+    The cost is coverage: the pill now appears for roughly six contexts in ten
+    instead of all of them. That is the right way round — the pill is optional,
+    and a suggestion that has to be re-read is worse than no suggestion.
     """
-    phrase = _PHRASE_STOP.split(raw, 1)[0]
-    phrase = phrase.rstrip()
-    if not phrase.strip():
+    phrase = _PHRASE_STOP.split(raw, 1)[0].strip()
+
+    ended = _SENTENCE_END.search(phrase)
+    if not ended:
+        return ""  # the model never finished the thought
+    phrase = phrase[: ended.end()].strip()
+
+    if _CONTRACTION_START.match(phrase):
         return ""
 
-    # Hitting the token limit usually truncates the last word, so drop it unless
-    # the phrase ended on its own at a sentence boundary.
-    if not _SENTENCE_END.search(phrase):
-        parts = phrase.rsplit(" ", 1)
-        phrase = parts[0] if len(parts) > 1 else ""
-
-    phrase = phrase.rstrip()
-    # Punctuation-only leftovers ("  .") are not worth offering.
+    words = phrase.split()
+    if not PHRASE_MIN_WORDS <= len(words) <= PHRASE_MAX_WORDS:
+        return ""
+    if any(_bare(word) in _UNSUITABLE for word in words):
+        return ""
     if not any(c.isalpha() for c in phrase):
         return ""
     return phrase
 
 
-def _predict_from_model(context: str) -> tuple[list[str], str]:
-    """Next-word candidates and a phrase completion, from one generate() call."""
+def _generate(context: str, max_new_tokens: int):
+    """(tokenizer, output, prompt_length) or None when the model can't run."""
     import torch
-    import wordfreq
 
     tokenizer, model = _get_model()
     if model is None:
-        return [], ""
+        return None
 
     # Never feed a trailing space. GPT-2's BPE attaches a space to the word that
     # follows it ("Ġthe"), so a dangling space is a token the model has barely
@@ -174,7 +224,7 @@ def _predict_from_model(context: str) -> tuple[list[str], str]:
     # and the caller re-inserts the spacing.
     context = context.rstrip()
     if not context:
-        return [], ""
+        return None
 
     inputs = tokenizer(context, return_tensors="pt")
     prompt_length = inputs["input_ids"].shape[1]
@@ -182,7 +232,7 @@ def _predict_from_model(context: str) -> tuple[list[str], str]:
     with _model_lock, torch.inference_mode():
         output = model.generate(
             **inputs,
-            max_new_tokens=PHRASE_TOKENS,
+            max_new_tokens=max_new_tokens,
             do_sample=False,               # deterministic: the same context
                                            # always offers the same pills
             repetition_penalty=1.2,
@@ -190,8 +240,20 @@ def _predict_from_model(context: str) -> tuple[list[str], str]:
             output_scores=True,
             return_dict_in_generate=True,
         )
+    return tokenizer, output, prompt_length
 
-    # ── word pills, from the first generation step's distribution ──
+
+def _words_from_model(context: str) -> list[str]:
+    """The three word pills — one forward pass, ~130ms."""
+    import torch
+    import wordfreq
+
+    generated = _generate(context, WORD_STEP_TOKENS)
+    if generated is None:
+        return []
+    tokenizer, output, _ = generated
+
+    # The first generation step's distribution is the next-word distribution.
     first_step = output.scores[0][0]
     _, indices = torch.topk(first_step, TOP_K)
 
@@ -213,18 +275,29 @@ def _predict_from_model(context: str) -> tuple[list[str], str]:
         if len(words) == WORD_SUGGESTIONS:
             break
 
+    return words
+
+
+def _phrase_from_model(context: str) -> str:
+    """The phrase completion — the expensive call, ~90% of the old total."""
+    generated = _generate(context, PHRASE_TOKENS)
+    if generated is None:
+        return ""
+    tokenizer, output, prompt_length = generated
+
     # The continuation carries the leading space the model generated; callers
     # insert at a caret whose spacing they already know, so hand it over bare.
-    phrase = _clean_phrase(tokenizer.decode(output.sequences[0][prompt_length:])).lstrip()
-    return words, phrase
+    return _clean_phrase(tokenizer.decode(output.sequences[0][prompt_length:])).lstrip()
 
 
 def predict(text: str) -> dict:
     """
-    Suggestions for the caret position at the end of `text`.
+    The three word pills for the caret at the end of `text` (F29).
 
-    `words` holds up to three single-word pills and `phrase` a longer
-    completion, empty when there isn't a good one.
+    Deliberately does *not* produce the phrase. One forward pass answers this in
+    about 130ms, where generating a phrase as well took roughly 1.6s — and the
+    pills are what has to keep up with typing. Callers ask for the phrase
+    separately via predict_phrase().
     """
     available, reason = status()
 
@@ -236,39 +309,68 @@ def predict(text: str) -> dict:
             # start-of-document prior, which is web boilerplate.
             return {
                 "words": [],
-                "phrase": "",
                 "available": available,
                 "unavailable_reason": None if available else reason,
             }
 
         match = _TRAILING_WORD.search(context)
         if match:
-            # Mid-word: finish the word being typed, no phrase. A one-letter
-            # stub is too ambiguous to rank, and handing the fragment to the
-            # model instead just produces unrelated text, so offer nothing.
+            # Mid-word: finish the word being typed. A one-letter stub is too
+            # ambiguous to rank, and handing the fragment to the model instead
+            # just produces unrelated text, so offer nothing.
             prefix = match.group()
             return {
                 "words": _complete_prefix(prefix) if len(prefix) >= MIN_PREFIX_LENGTH else [],
-                "phrase": "",
                 "available": True,  # prefix search needs no model
                 "unavailable_reason": None,
             }
 
-        words, phrase = _predict_from_model(context)
+        words = _words_from_model(context)
         available, reason = status()
         return {
             "words": words,
-            "phrase": phrase,
             "available": available,
             "unavailable_reason": None if available else reason,
         }
 
     except Exception as exc:  # noqa: BLE001
         # A prediction is a convenience; never let it break the writing page.
-        logger.warning("Prediction failed: %s", exc)
+        logger.warning("Word prediction failed: %s", exc)
         return {
             "words": [],
-            "phrase": "",
             "available": False,
             "unavailable_reason": "Prediction failed.",
         }
+
+
+def predict_phrase(text: str) -> dict:
+    """
+    A phrase completion for the caret at the end of `text` (v5.0).
+
+    Split out from predict() because it is the slow half: the client fires it on
+    a longer pause so the word pills are never held up behind it. Empty is a
+    normal answer — mid-word there is nothing to complete, and at a boundary the
+    model often fails to finish a sentence (see _clean_phrase).
+    """
+    available, reason = status()
+
+    try:
+        context = text[-CONTEXT_CHARS:]
+        if not context.strip() or _TRAILING_WORD.search(context):
+            return {
+                "phrase": "",
+                "available": available,
+                "unavailable_reason": None if available else reason,
+            }
+
+        phrase = _phrase_from_model(context)
+        available, reason = status()
+        return {
+            "phrase": phrase,
+            "available": available,
+            "unavailable_reason": None if available else reason,
+        }
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Phrase prediction failed: %s", exc)
+        return {"phrase": "", "available": False, "unavailable_reason": "Prediction failed."}
