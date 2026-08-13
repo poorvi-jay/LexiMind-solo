@@ -14,6 +14,7 @@ import { usePrefs } from '../context/PreferencesContext'
 import { useToast } from '../hooks/useToast.js'
 import { useTTSPlayer } from '../hooks/useTTSPlayer'
 import { useWordPredict } from '../hooks/useWordPredict'
+import { useWritingSession } from '../hooks/useWritingSession'
 
 /** Matches MAX_CONTENT_CHARS in backend/routers/writing.py. */
 const MAX_CONTENT_CHARS = 50_000
@@ -421,6 +422,15 @@ export default function WritingPage() {
   }, [])
 
   const wordCount = useMemo(() => countWords(content), [content])
+
+  // F48 — the session's counters, template included, logged to writing_sessions.
+  useWritingSession({
+    documentId,
+    wordCount,
+    counts: checks.counts,
+    template,
+    enabled: ready,
+  })
 
   let status = content ? 'All changes saved' : 'Nothing written yet'
   let statusTone = 'text-gray-400 dark:text-gray-500'
