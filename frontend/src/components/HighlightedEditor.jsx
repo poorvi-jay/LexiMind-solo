@@ -107,7 +107,13 @@ export default function HighlightedEditor({
 
       {/* `block` matters: as an inline-block the textarea leaves a baseline gap
           underneath, so the wrapper grows taller than it and shows a strip of
-          background below the rounded border. */}
+          background below the rounded border.
+
+          min-h is the PRD's 400px floor for F25, in px rather than rem: 25rem
+          only equals 400px at a 16px root, so a reader who has raised their
+          browser's default font size would silently change the floor. The
+          mirror is inset-0 and follows this box, so this is the only place the
+          height is set. */}
       <textarea
         id={id}
         ref={textareaRef}
@@ -119,7 +125,7 @@ export default function HighlightedEditor({
         disabled={disabled}
         placeholder={placeholder}
         spellCheck="false"
-        className="relative block min-h-[24rem] w-full resize-y rounded-2xl border
+        className="relative block min-h-[400px] w-full resize-y rounded-2xl border
                    border-gray-200 bg-transparent p-5 text-gray-900
                    focus:border-blue-400 focus:outline-none disabled:opacity-60
                    dark:border-gray-700 dark:text-white"
