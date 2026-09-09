@@ -25,3 +25,5 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+# MRC dataset — training input only, ~4MB, re-downloadable
+backend/ml/data/

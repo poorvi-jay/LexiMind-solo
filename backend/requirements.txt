@@ -65,3 +65,14 @@ transformers==5.15.0            # DistilGPT-2 for next-word and phrase suggestio
 # install it from this pinned wheel, or run:
 #   python -m spacy download en_core_web_sm
 en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+
+# ── word difficulty classifier (M3 phase 1) ───────────────────────────────
+scikit-learn==1.9.0             # GradientBoostingClassifier for F33
+joblib==1.5.3                   # persists/loads backend/ml/classifier.joblib
+narwhals==2.26.0                # scikit-learn 1.9 dataframe-interchange dep;
+                                # pip resolves it anyway, pinned so a fresh
+                                # venv can't end up without it.
+# pandas is deliberately NOT used. Windows Smart App Control blocks
+# pandas/_libs/reshape*.pyd on this machine (same class of issue as the spaCy
+# .pyd), so train_classifier.py reads the MRC CSV with the stdlib csv module
+# instead. Nothing at request time needs a dataframe.
