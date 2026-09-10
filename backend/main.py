@@ -21,7 +21,7 @@ logging.getLogger("backend").setLevel(logging.INFO)
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from backend.database import init_db
-from backend.services import nlp_service, prediction_service
+from backend.services import classifier_service, nlp_service, prediction_service
 
 
 @asynccontextmanager
@@ -37,6 +37,13 @@ async def lifespan(app: FastAPI):
     # load doesn't hold up the checks warming beside it.
     threading.Thread(
         target=prediction_service.warm_up, name="predict-warmup", daemon=True
+    ).start()
+
+    # The word difficulty classifier (F33). A cold joblib.load() measures ~2.9s,
+    # which is small next to the other two but still far too slow to pay on the
+    # first /classify — the Reading page calls it before playback starts.
+    threading.Thread(
+        target=classifier_service.warm_up, name="classify-warmup", daemon=True
     ).start()
 
     yield
@@ -104,6 +111,10 @@ async def health():
         "grammar": nlp_service.grammar_readiness(),
         # F29. DistilGPT-2, ~350MB on first run.
         "prediction": prediction_service.readiness(),
+        # F33. 'unavailable' means /classify is serving the wordfreq fallback
+        # because backend/ml/classifier.joblib is missing — run
+        # backend/ml/train_classifier.py to build it.
+        "classifier": classifier_service.readiness(),
     }
     return {
         "status": "ok",
