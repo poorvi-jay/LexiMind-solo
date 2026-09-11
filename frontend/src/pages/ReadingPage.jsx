@@ -9,6 +9,7 @@ import { api } from '../utils/api'
 import { usePrefs } from '../context/PreferencesContext'
 import { useTTSPlayer } from '../hooks/useTTSPlayer'
 import { useTTSPrefetch } from '../hooks/useTTSPrefetch'
+import { useReadingSession } from '../hooks/useReadingSession'
 import { useToast } from '../hooks/useToast.js'
 
 const SAMPLE_TEXT =
@@ -38,6 +39,8 @@ export default function ReadingPage() {
   const [classificationReady, setClassificationReady] = useState(false)
   // True while handlePlay is generating audio, before play() takes over isLoading.
   const [isPreparing, setIsPreparing] = useState(false)
+  // Where the loaded text came from, logged with each reading session (F37).
+  const [sourceType, setSourceType] = useState('paste')
 
   // Store the raw word_timings so we can use backend's word list
   const [wordTimings, setWordTimings]     = useState([])
@@ -85,8 +88,33 @@ export default function ReadingPage() {
     return words
   }, [wordTimings, words])
 
+  const totalWords = displayWords.length
+
+  // Hard words in the loaded text, counted by token — what the reader sees
+  // highlighted. Feeds both the complexity badge and the session log.
+  const hardWordCount = useMemo(() => {
+    if (!classificationReady) return 0
+    return words.filter(word => classifiedWords[normalizeWord(word)] === 'Hard').length
+  }, [classificationReady, words, classifiedWords])
+
+  const { recordReplay, end: endSession } = useReadingSession({
+    isPlaying, isPaused, isPreparing,
+    activeIndex, totalWords, hardWordCount,
+    sourceType,
+    simplified: simplified !== null,
+    complexityScore: complexity?.flesch_kincaid_grade ?? null,
+  })
+
   /* ── Load text ── */
   function loadText(raw, options = {}) {
+  // Different text is a different session: report the one that is ending.
+  endSession()
+  // Keep the origin across edits, simplification and restore — fixing a few
+  // OCR mistakes doesn't turn a scanned page into pasted text. Only text typed
+  // into an empty box counts as a paste.
+  if (options.source) setSourceType(options.source)
+  else if (!text.trim()) setSourceType('paste')
+
   const cleaned = raw.trim()
   setText(raw)
   setActiveIndex(-1)
@@ -162,7 +190,7 @@ export default function ReadingPage() {
       formData.append('file', file)
       const endpoint = file.type === 'application/pdf' ? '/ocr/pdf' : '/ocr/image'
       const data = await api.postForm(endpoint, formData)
-      loadText(data.text)
+      loadText(data.text, { source: file.type === 'application/pdf' ? 'pdf' : 'image' })
       showToast(`Extracted ${data.word_count} words.`, 'success')
     } catch (err) {
       showToast(err.message, 'error')
@@ -200,6 +228,8 @@ export default function ReadingPage() {
     const clean = normalizeWord(word)
     if (!clean) return
     setSelectedWord(clean)
+    // Asking to hear a word again is what the repeat log counts (F41, F49).
+    recordReplay(clean)
     playWord(clean)
   }
 
@@ -264,6 +294,9 @@ export default function ReadingPage() {
   }
 
   function handleStop() {
+    // Ended explicitly: Stop pressed while paused never passes through the
+    // playing -> stopped transition that useReadingSession watches for.
+    endSession()
     stop()
     setWordTimings([])
     setActiveIndex(-1)
@@ -304,14 +337,8 @@ export default function ReadingPage() {
 
   const classifierHardWordPct = useMemo(() => {
     if (!classificationReady || words.length === 0) return null
-
-    const hardCount = words.filter(word => {
-      const clean = normalizeWord(word)
-      return classifiedWords[clean] === 'Hard'
-    }).length
-
-    return Math.round((hardCount / words.length) * 100)
-  }, [classificationReady, words, classifiedWords])
+    return Math.round((hardWordCount / words.length) * 100)
+  }, [classificationReady, words, hardWordCount])
 
   const displayedComplexity = useMemo(() => {
     if (!complexity || classifierHardWordPct === null) return complexity
@@ -399,7 +426,7 @@ export default function ReadingPage() {
 
                 <button
                   type="button"
-                  onClick={() => loadText(SAMPLE_TEXT)}
+                  onClick={() => loadText(SAMPLE_TEXT, { source: 'sample' })}
                   className="group flex flex-col items-center gap-3
                               rounded-2xl border border-gray-200 bg-gray-50 p-6
                               transition-colors hover:border-blue-300 hover:bg-blue-50
@@ -452,7 +479,7 @@ export default function ReadingPage() {
                     </label>
                     <button
                       type="button"
-                      onClick={() => loadText(SAMPLE_TEXT)}
+                      onClick={() => loadText(SAMPLE_TEXT, { source: 'sample' })}
                       className="rounded-lg border border-gray-200 px-3 py-2 text-xs
                                   font-semibold text-gray-600 hover:bg-gray-50
                                   dark:border-gray-700 dark:text-gray-300"

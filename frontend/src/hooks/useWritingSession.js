@@ -6,7 +6,8 @@ import { api } from '../utils/api'
 export const SESSION_FLUSH_INTERVAL_MS = 30_000
 
 /**
- * F48 — logs the writing session's counters, including `template_used`.
+ * F38 / F48 — logs the writing session's counters, including `template_used`,
+ * to POST /sessions/writing.
  *
  * This is analytics, not the writer's work: every failure is swallowed. A
  * counter that doesn't reach the server is worth nothing next to interrupting
@@ -60,7 +61,7 @@ export function useWritingSession({ documentId, wordCount, counts, template, ena
 
     inFlightRef.current = true
     try {
-      const saved = await api.patch('/writing/session', {
+      const saved = await api.post('/sessions/writing', {
         session_id: sessionIdRef.current,
         ...payload,
       })

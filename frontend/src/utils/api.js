@@ -31,7 +31,7 @@ export class ApiError extends Error {
   }
 }
 
-async function request(method, path, body = null, isFormData = false) {
+async function request(method, path, body = null, isFormData = false, { keepalive = false } = {}) {
   const headers = isFormData ? {} : { 'Content-Type': 'application/json' }
 
   // Every protected endpoint expects a bearer token; read it per-request so a
@@ -43,6 +43,9 @@ async function request(method, path, body = null, isFormData = false) {
     method,
     headers,
     body: isFormData ? body : body ? JSON.stringify(body) : null,
+    // Lets a request outlive the page that sent it, for reports fired as the
+    // tab closes. Browsers cap keepalive bodies at 64 KB.
+    keepalive,
   })
 
   if (!res.ok) {
@@ -60,7 +63,7 @@ async function request(method, path, body = null, isFormData = false) {
 
 export const api = {
   get:  path => request('GET', path),
-  post: (path, body) => request('POST', path, body),
+  post: (path, body, options) => request('POST', path, body, false, options),
   postForm: (path, formData) => request('POST', path, formData, true),
   patch: (path, body) => request('PATCH', path, body),
   delete: path => request('DELETE', path),

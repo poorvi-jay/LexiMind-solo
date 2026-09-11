@@ -1,15 +1,15 @@
 """
 backend/models.py
-SQLAlchemy models for the three tables M2 needs: users, saved_documents,
-writing_sessions.
+SQLAlchemy models: users, saved_documents and writing_sessions (M2), and
+reading_sessions, word_repeat_log and word_bank (M3).
 
 Adapted from PRD Section 4 (PostgreSQL 15) to SQLite:
   - UUID PK           -> String(36) holding str(uuid4()), generated in Python
   - TIMESTAMP (UTC)   -> DateTime with a timezone-aware UTC default
   - VARCHAR(n)/BOOLEAN map directly
 
-The other three PRD tables (reading_sessions, word_repeat_log, word_bank) belong
-to the analytics/word-bank module and are deliberately not created here.
+The three M3 tables are new tables rather than new columns on existing ones, so
+create_all() builds them on an existing leximind.db with no _ADDED_COLUMNS entry.
 
 Preference defaults follow the frontend's actual DEFAULTS in
 frontend/src/hooks/usePreferences.js, which have drifted from the PRD's stale
@@ -19,9 +19,20 @@ Phase 2 localStorage migration would lose it.
 """
 
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import relationship
 
 from backend.database import Base
@@ -33,6 +44,11 @@ def _uuid() -> str:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _today() -> date:
+    """Today in UTC — the day a new word bank entry is first due."""
+    return datetime.now(timezone.utc).date()
 
 
 class User(Base):
@@ -70,6 +86,15 @@ class User(Base):
     )
     reset_tokens = relationship(
         "PasswordResetToken", back_populates="user", cascade="all, delete-orphan"
+    )
+    reading_sessions = relationship(
+        "ReadingSession", back_populates="user", cascade="all, delete-orphan"
+    )
+    word_repeats = relationship(
+        "WordRepeatLog", back_populates="user", cascade="all, delete-orphan"
+    )
+    word_bank = relationship(
+        "WordBank", back_populates="user", cascade="all, delete-orphan"
     )
 
 
@@ -130,3 +155,76 @@ class WritingSession(Base):
     template_used = Column(String(50), nullable=True)
 
     user = relationship("User", back_populates="writing_sessions")
+
+
+class ReadingSession(Base):
+    """F37 — one stretch of listening to one loaded text.
+
+    Only sessions with at least 30 seconds of active playback are stored; see
+    backend/services/session_service.py for why, and for what happens to the
+    word replays of shorter ones.
+    """
+
+    __tablename__ = "reading_sessions"
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    user_id = Column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    date = Column(DateTime, nullable=False, default=_utcnow)           # session start, UTC
+    wpm = Column(Float, nullable=False, default=0.0)                   # words reached per active minute
+    total_words = Column(Integer, nullable=False, default=0)
+    hard_word_count = Column(Integer, nullable=False, default=0)       # tokens labelled Hard
+    repeat_count = Column(Integer, nullable=False, default=0)          # word replays this session
+    duration_seconds = Column(Integer, nullable=False, default=0)      # active playback, pauses excluded
+    source_type = Column(String(10), nullable=False, default="paste")  # image | pdf | paste | sample
+    simplified = Column(Boolean, nullable=False, default=False)
+    complexity_score = Column(Float, nullable=True)                    # Flesch-Kincaid grade at start
+
+    user = relationship("User", back_populates="reading_sessions")
+
+
+class WordRepeatLog(Base):
+    """F41/F49 — how often a reader has asked to hear each word, across all sessions."""
+
+    __tablename__ = "word_repeat_log"
+    # One row per word per reader, enforced rather than merely expected.
+    __table_args__ = (UniqueConstraint("user_id", "word", name="uq_word_repeat_log_user_word"),)
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    user_id = Column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    word = Column(String(100), nullable=False)                   # normalised, lowercase
+    repeat_count = Column(Integer, nullable=False, default=0)    # cumulative across all sessions
+    difficulty_label = Column(String(10), nullable=True)         # classifier label at last repeat
+    last_seen = Column(DateTime, nullable=False, default=_utcnow)
+
+    user = relationship("User", back_populates="word_repeats")
+
+
+class WordBank(Base):
+    """F49-F51 — a reader's personal practice list, scheduled by SM-2.
+
+    Created alongside the other M3 tables so the schema lands in one piece;
+    nothing writes to it until the word bank features are built.
+    """
+
+    __tablename__ = "word_bank"
+    __table_args__ = (UniqueConstraint("user_id", "word", name="uq_word_bank_user_word"),)
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    user_id = Column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    word = Column(String(100), nullable=False)                     # normalised, lowercase
+    difficulty_label = Column(String(10), nullable=True)           # latest classifier label
+    sm2_ef = Column(Float, nullable=False, default=2.5)            # easiness factor, never below 1.3
+    sm2_interval = Column(Integer, nullable=False, default=1)      # days until the next review
+    sm2_repetitions = Column(Integer, nullable=False, default=0)   # consecutive correct; resets on a miss
+    next_review = Column(Date, nullable=False, default=_today)     # drives the drill-due badge (F51)
+    total_drills = Column(Integer, nullable=False, default=0)
+    last_quality = Column(Integer, nullable=True)                  # last SM-2 grade, 0-5
+    added_at = Column(DateTime, nullable=False, default=_utcnow)
+
+    user = relationship("User", back_populates="word_bank")

@@ -5,7 +5,7 @@ F25 writing notepad · F31 autosave · F32 named documents · F48 template
 Endpoints:
     GET    /writing/autosave          — the document to restore on load
     PATCH  /writing/autosave          — upsert the draft
-    PATCH  /writing/session           — upsert this writing session's counters
+    PATCH  /writing/session           — deprecated alias of POST /sessions/writing
     GET    /writing/documents         — list this user's documents
     POST   /writing/documents         — save the current work as a new document
     GET    /writing/documents/{id}    — load one into the notepad
@@ -20,12 +20,11 @@ afterwards; a client that has lost its id (fresh browser, another device) calls
 GET /writing/autosave and picks up the most recently updated document. The CRUD
 endpoints below list, open and delete those same rows.
 
-PATCH /writing/session is the local stand-in for M3's POST /sessions/writing,
-which does not exist in this repo. F48 requires the chosen structure template to
-be logged to writing_sessions.template_used, and the error counts alongside it
-only exist on the client (they come back from /nlp/check), so the notepad has to
-report them rather than the server inferring them. If M3's endpoint ever lands,
-this is the call to repoint — the payload is deliberately the same shape.
+Writing-session logging (F38, and F48's template_used) lives in
+routers/sessions.py as POST /sessions/writing. It started here as PATCH
+/writing/session, a stand-in for that M3 endpoint with the same payload; the old
+path is still registered below on the very same handler, marked deprecated, so
+any caller of it keeps working and nothing is logged twice.
 
 Every lookup filters on the owner and returns the same 404 for "no such
 document" and "someone else's document", so ids can't be probed for existence.
@@ -40,7 +39,8 @@ from sqlalchemy.orm import Session
 
 from backend.database import get_db
 from backend.dependencies import get_current_user
-from backend.models import SavedDocument, User, WritingSession
+from backend.models import SavedDocument, User
+from backend.routers.sessions import WritingSessionOut, log_writing_session
 
 router = APIRouter()
 
@@ -128,38 +128,6 @@ class AutosaveOut(UtcTimestamps):
     updated_at: datetime
 
 
-class SessionRequest(BaseModel):
-    """F48 — the counters for one stretch of writing.
-
-    Counts are absolute totals for the session, not deltas, so a repeated or
-    out-of-order report settles on the same row rather than compounding.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    # Absent on the first report of a session; the id comes back and is reused.
-    session_id: str | None = None
-    word_count: int = Field(ge=0)
-    spell_error_count: int = Field(default=0, ge=0)
-    grammar_error_count: int = Field(default=0, ge=0)
-    homophone_flag_count: int = Field(default=0, ge=0)
-    template_used: Literal["essay", "email", "report"] | None = None
-
-
-class SessionOut(BaseModel):
-    id: str
-    date: datetime
-    word_count: int
-    spell_error_count: int
-    grammar_error_count: int
-    homophone_flag_count: int
-    template_used: str | None
-
-    @field_serializer("date")
-    def _stamp_utc(self, value: datetime) -> datetime:
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-
-
 def _dated_title() -> str:
     """Default name for a document saved without one, e.g. 'Untitled — 12 Aug 2026'."""
     return f"{DEFAULT_TITLE} — {datetime.now().strftime('%d %b %Y')}"
@@ -171,14 +139,6 @@ def _owned_document(document_id: str, user: User, db: Session) -> SavedDocument:
     if doc is None or doc.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Document not found.")
     return doc
-
-
-def _owned_session(session_id: str, user: User, db: Session) -> WritingSession:
-    """Fetch a session row or 404 — same rule as documents."""
-    row = db.get(WritingSession, session_id)
-    if row is None or row.user_id != user.id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Writing session not found.")
-    return row
 
 
 def _summarize(doc: SavedDocument) -> DocumentSummary:
@@ -253,49 +213,18 @@ def autosave(
     )
 
 
-# ── writing session analytics (F48) ────────────────────────────────────
-@router.patch("/writing/session", response_model=SessionOut)
-def log_session(
-    req: SessionRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """F48 — record the session's counters, including which template was used.
-
-    Upsert, like autosave: no id creates the row and returns one, an id updates
-    it. `date` is the moment the session was first reported and is never moved,
-    so it stays the session's start rather than its last update.
-    """
-    if req.session_id:
-        row = _owned_session(req.session_id, current_user, db)
-    else:
-        # A page that was opened and left has nothing worth a row.
-        if req.word_count == 0:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Nothing written yet.")
-        row = WritingSession(user_id=current_user.id)
-        db.add(row)
-
-    row.word_count = req.word_count
-    row.spell_error_count = req.spell_error_count
-    row.grammar_error_count = req.grammar_error_count
-    row.homophone_flag_count = req.homophone_flag_count
-    # Unlike autosave's `template`, null here means "no template" rather than "no
-    # change": the client always knows what the notepad was started from, and a
-    # writer who clears the dropdown should not leave a stale label on the row.
-    row.template_used = req.template_used
-
-    db.commit()
-    db.refresh(row)
-
-    return SessionOut(
-        id=row.id,
-        date=row.date,
-        word_count=row.word_count,
-        spell_error_count=row.spell_error_count,
-        grammar_error_count=row.grammar_error_count,
-        homophone_flag_count=row.homophone_flag_count,
-        template_used=row.template_used,
-    )
+# ── writing session analytics (F38 / F48) ──────────────────────────────
+# Moved to POST /sessions/writing (routers/sessions.py). The old path stays
+# registered on the same handler so existing callers keep working; one handler
+# means one row per session whichever path reports it.
+router.add_api_route(
+    "/writing/session",
+    log_writing_session,
+    methods=["PATCH"],
+    response_model=WritingSessionOut,
+    deprecated=True,
+    summary="Deprecated: use POST /sessions/writing",
+)
 
 
 # ── named documents (F32) ──────────────────────────────────────────────

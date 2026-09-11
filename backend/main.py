@@ -78,6 +78,7 @@ from backend.routers.reading import router as reading_router
 from backend.routers.classify import router as classify_router  # import the classify router
 from backend.routers.writing import router as writing_router
 from backend.routers.nlp import router as nlp_router
+from backend.routers.sessions import router as sessions_router
 app.include_router(auth_router, tags=["Auth"])
 app.include_router(ocr_router, tags=["OCR"])
 app.include_router(tts_router, tags=["TTS"])
@@ -85,6 +86,7 @@ app.include_router(reading_router, tags=["Reading"])
 app.include_router(classify_router, tags=["Classify"])  # include the classify router with a tag
 app.include_router(writing_router, tags=["Writing"])
 app.include_router(nlp_router, tags=["NLP"])
+app.include_router(sessions_router, tags=["Sessions"])
 @app.get("/health")
 async def health():
     """
