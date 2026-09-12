@@ -76,3 +76,6 @@ narwhals==2.26.0                # scikit-learn 1.9 dataframe-interchange dep;
 # pandas/_libs/reshape*.pyd on this machine (same class of issue as the spaCy
 # .pyd), so train_classifier.py reads the MRC CSV with the stdlib csv module
 # instead. Nothing at request time needs a dataframe.
+
+# ── tests (dev only) ──────────────────────────────────────────────────────
+pytest==9.1.1                   # backend/tests; the API itself does not need it
