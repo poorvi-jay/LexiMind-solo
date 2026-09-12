@@ -4,14 +4,37 @@
     {
       "name": "leximind-backend",
       "runtimeExecutable": "backend/venv/Scripts/python.exe",
-      "runtimeArgs": ["-m", "uvicorn", "backend.main:app", "--port", "8000"],
+      "runtimeArgs": [
+        "-m",
+        "uvicorn",
+        "backend.main:app",
+        "--port",
+        "8000"
+      ],
       "port": 8000
     },
     {
       "name": "leximind-frontend",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["--prefix", "frontend", "run", "dev"],
+      "runtimeArgs": [
+        "--prefix",
+        "frontend",
+        "run",
+        "dev"
+      ],
       "port": 5173
+    },
+    {
+      "name": "leximind-backend-8001",
+      "runtimeExecutable": "backend/venv/Scripts/python.exe",
+      "runtimeArgs": [
+        "-m",
+        "uvicorn",
+        "backend.main:app",
+        "--port",
+        "8001"
+      ],
+      "port": 8001
     }
   ]
 }

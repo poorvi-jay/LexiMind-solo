@@ -7,6 +7,7 @@ import NavBar from './components/NavBar.jsx'
 import ReadingPage from './pages/ReadingPage.jsx'
 import ResetPasswordPage from './pages/ResetPasswordPage.jsx'
 import SettingsPage from './pages/SettingsPage.jsx'
+import WordBankDrillPage from './pages/WordBankDrillPage.jsx'
 import WritingPage from './pages/WritingPage.jsx'
 import { useAuthContext } from './context/AuthContext.jsx'
 
@@ -48,6 +49,7 @@ export default function App() {
         <Route path="/reading" element={<RequireAuth><ReadingPage /></RequireAuth>} />
         <Route path="/writing" element={<RequireAuth><WritingPage /></RequireAuth>} />
         <Route path="/analytics" element={<RequireAuth><AnalyticsPage /></RequireAuth>} />
+        <Route path="/wordbank/drill" element={<RequireAuth><WordBankDrillPage /></RequireAuth>} />
         <Route path="/settings" element={<RequireAuth><SettingsPage /></RequireAuth>} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

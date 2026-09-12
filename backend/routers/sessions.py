@@ -76,6 +76,8 @@ class ReadingSessionOut(BaseModel):
     session_id: str | None
     wpm: float | None
     words_logged: int
+    # Words this session pushed over the replay threshold into the bank (F49).
+    words_added_to_bank: list[str] = []
 
 
 @router.post("/sessions/reading", response_model=ReadingSessionOut)
@@ -92,6 +94,7 @@ def log_reading(
         session_id=session.id if session else None,
         wpm=session.wpm if session else None,
         words_logged=len(result.repeat_totals),
+        words_added_to_bank=result.promoted,
     )
 
 

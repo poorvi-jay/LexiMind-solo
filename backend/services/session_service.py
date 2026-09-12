@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from backend.models import ReadingSession, User, WordRepeatLog
 from backend.services.classifier_service import classify_batch, normalize_word
+from backend.services.wordbank_service import sync_word_bank
 
 MIN_READING_SECONDS = 30
 WORD_COLUMN_WIDTH = 100  # word_repeat_log.word and word_bank.word
@@ -43,6 +44,8 @@ class ReadingLogResult:
     # Every word whose count changed, mapped to its new all-time total. The word
     # bank's auto-population (F49) reads this to find words crossing its threshold.
     repeat_totals: dict[str, int] = field(default_factory=dict)
+    # Words this session added to the word bank (F49).
+    promoted: list[str] = field(default_factory=list)
 
 
 def _utcnow() -> datetime:
@@ -137,6 +140,10 @@ def log_reading_session(
             row.difficulty_label = labels[word]
             row.last_seen = now
             result.repeat_totals[word] = row.repeat_count
+
+        # F49, inside this transaction: a session is never committed without
+        # the word bank it earned.
+        result.promoted = sync_word_bank(db, user, result.repeat_totals, labels)
 
     if result.session is not None or repeats:
         db.commit()

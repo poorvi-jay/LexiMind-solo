@@ -8,6 +8,7 @@ const links = [
   { to: '/reading', label: 'Reading' },
   { to: '/writing', label: 'Writing' },
   { to: '/analytics', label: 'Analytics' },
+  { to: '/wordbank/drill', label: 'Word bank' },
   { to: '/settings', label: 'Settings' },
 ]
 
