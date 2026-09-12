@@ -17,13 +17,20 @@ from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from backend.database import get_db
 from backend.dependencies import get_current_user
 from backend.models import User, WordBank
 from backend.services.classifier_service import normalize_word
-from backend.services.sm2_service import is_mastered, update_sm2
+from backend.services.sm2_service import (
+    MASTERED_EF,
+    MASTERED_INTERVAL,
+    is_mastered,
+    update_sm2,
+)
+from backend.services.wordbank_service import current_streak, record_drill_day
 
 router = APIRouter()
 
@@ -51,6 +58,16 @@ class WordBankEntry(BaseModel):
     @field_serializer("added_at")
     def _stamp_utc(self, value: datetime) -> datetime:
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+class WordBankStats(BaseModel):
+    words_due_today: int
+    # The first few due words, for the homepage reminder. Deliberately a
+    # preview: words_due_today is the true total, which the badge shows.
+    due_words: list[str]
+    total_in_bank: int
+    mastered: int
+    streak: int
 
 
 class DrillResultRequest(BaseModel):
@@ -126,6 +143,42 @@ def drill_queue(
     return [_entry(row, today) for row in rows]
 
 
+@router.get("/wordbank/stats", response_model=WordBankStats)
+def word_bank_stats(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """F51 — the numbers behind the nav badge and the homepage reminder.
+
+    words_due_today counts every due word, not the drill's capped 20: the badge
+    should say how much is waiting, even when one sitting cannot clear it.
+    """
+    today = date.today()
+    due = [
+        row.word
+        for row in db.query(WordBank.word)
+        .filter(WordBank.user_id == current_user.id, WordBank.next_review <= today)
+        .order_by(WordBank.next_review.asc(), WordBank.word.asc())
+    ]
+    total, mastered = (
+        db.query(
+            func.count(WordBank.id),
+            func.count(WordBank.id).filter(
+                WordBank.sm2_ef >= MASTERED_EF, WordBank.sm2_interval >= MASTERED_INTERVAL
+            ),
+        )
+        .filter(WordBank.user_id == current_user.id)
+        .one()
+    )
+    return WordBankStats(
+        words_due_today=len(due),
+        due_words=due[:5],
+        total_in_bank=total,
+        mastered=mastered,
+        streak=current_streak(db, current_user, today),
+    )
+
+
 @router.post("/wordbank/drill/result", response_model=DrillResultOut)
 def record_drill_result(
     req: DrillResultRequest,
@@ -153,6 +206,9 @@ def record_drill_result(
     row.next_review = state.next_review
     row.total_drills += 1
     row.last_quality = req.quality
+    # Same transaction as the grade, so a counted answer always counts towards
+    # the streak (F51).
+    record_drill_day(db, current_user)
     db.commit()
     db.refresh(row)
 

@@ -1,4 +1,7 @@
 import { Link } from 'react-router-dom'
+import { useEffect } from 'react'
+
+import { useWordBankStats } from '../hooks/useWordBankStats'
 
 /* ─── Feature cards (user-facing language, not technical) ─── */
 const FEATURES = [
@@ -49,8 +52,47 @@ const BENEFITS = [
 ]
 
 export default function HomePage() {
+  // F51's reminder. Null when logged out, so the card simply never renders.
+  const { stats, refresh } = useWordBankStats()
+  useEffect(() => {
+    refresh()
+  }, [refresh])
+
+  const dueCount = stats?.words_due_today ?? 0
+
   return (
     <main className="min-h-screen bg-gray-50 px-4 py-12 dark:bg-[#1E1E1E] sm:px-6">
+      {/* ═══ F51 · practice reminder ═══ */}
+      {dueCount > 0 && (
+        <section
+          className="mx-auto mb-10 flex max-w-6xl flex-wrap items-center justify-between gap-4
+                     rounded-2xl border border-blue-200 bg-blue-50 p-5
+                     dark:border-blue-900 dark:bg-blue-950/40"
+          aria-labelledby="practice-reminder-heading"
+        >
+          <div>
+            <h2
+              id="practice-reminder-heading"
+              className="text-base font-semibold text-blue-900 dark:text-blue-100"
+            >
+              {dueCount} {dueCount === 1 ? 'word is' : 'words are'} ready to practise
+            </h2>
+            <p className="mt-1 text-sm text-blue-800/80 dark:text-blue-200/80">
+              {stats.due_words.join(' · ')}
+              {dueCount > stats.due_words.length && ' …'}
+            </p>
+          </div>
+          <Link
+            to="/wordbank/drill"
+            className="rounded-2xl bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white
+                       hover:bg-blue-700 focus-visible:outline-2 focus-visible:outline-offset-2
+                       focus-visible:outline-blue-500"
+          >
+            Start drill
+          </Link>
+        </section>
+      )}
+
       {/* ═══ Hero Section ═══ */}
       <section
         className="mx-auto grid max-w-6xl gap-10 lg:grid-cols-[1.05fr_0.95fr] lg:items-center"

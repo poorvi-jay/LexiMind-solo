@@ -1,7 +1,8 @@
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 
-import { startTransition } from 'react'
+import { startTransition, useEffect } from 'react'
 import { useAuthContext } from '../context/AuthContext.jsx'
+import { useWordBankStats } from '../hooks/useWordBankStats'
 
 const links = [
   { to: '/', label: 'Home' },
@@ -16,6 +17,14 @@ export default function NavBar() {
   const { pathname } = useLocation()
   const { isAuthenticated, user, logout } = useAuthContext()
   const navigate = useNavigate()
+
+  // F51's badge. Refetched on every navigation rather than only on mount, so
+  // finishing a drill and leaving the page clears the count.
+  const { stats, refresh } = useWordBankStats()
+  const dueCount = stats?.words_due_today ?? 0
+  useEffect(() => {
+    refresh()
+  }, [pathname, refresh])
 
   // Home is public, so it's the natural place to land after logging out.
   // Both updates go in one transition: the router runs navigation as a
@@ -91,6 +100,17 @@ export default function NavBar() {
                   }`}
               >
                 {link.label}
+                {/* Hidden entirely at zero — an empty badge is worse than none. */}
+                {link.to === '/wordbank/drill' && dueCount > 0 && (
+                  <span
+                    className="ml-2 inline-flex min-w-[1.25rem] items-center justify-center
+                               rounded-full bg-blue-600 px-1.5 py-0.5 text-xs font-bold
+                               leading-none text-white"
+                  >
+                    {dueCount}
+                    <span className="sr-only"> words due for practice</span>
+                  </span>
+                )}
               </Link>
             )
           })}

@@ -96,6 +96,9 @@ class User(Base):
     word_bank = relationship(
         "WordBank", back_populates="user", cascade="all, delete-orphan"
     )
+    drill_days = relationship(
+        "DrillDay", back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class SavedDocument(Base):
@@ -228,3 +231,30 @@ class WordBank(Base):
     added_at = Column(DateTime, nullable=False, default=_utcnow)
 
     user = relationship("User", back_populates="word_bank")
+
+
+class DrillDay(Base):
+    """F51 — one row per day a reader practised, for the streak.
+
+    word_bank holds only each word's latest state, so it cannot say which days
+    had practice: drilling a word again overwrites the evidence of the previous
+    time. This is the smallest record that can answer "how many days in a row",
+    and it leaves M4 a real practice history rather than a derived guess.
+
+    The day comes from the server's clock, so a reader drilling either side of
+    midnight in a distant timezone can see a day land on the wrong side. The
+    stakes are a reminder card's counter, which is not worth carrying a
+    timezone per account for.
+    """
+
+    __tablename__ = "drill_days"
+    __table_args__ = (UniqueConstraint("user_id", "day", name="uq_drill_days_user_day"),)
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    user_id = Column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    day = Column(Date, nullable=False, default=_today)
+    words_drilled = Column(Integer, nullable=False, default=0)
+
+    user = relationship("User", back_populates="drill_days")
