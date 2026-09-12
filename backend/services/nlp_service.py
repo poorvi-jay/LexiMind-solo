@@ -12,7 +12,11 @@ in a background thread and every request reuses the same objects.
 
 import logging
 import os
+import re
+import sys
 import threading
+import time
+import types
 from pathlib import Path
 
 import jellyfish
@@ -121,8 +125,12 @@ NOMINALISED_ADJECTIVES = {"best", "worst", "own", "all", "utmost", "most", "leas
 
 # ── lazily built resources ─────────────────────────────────────────────
 _lock = threading.Lock()
+# Taken inside _lock by warm_up, and alone by check_text — always in that order,
+# so the two can't deadlock. Serialises spaCy load attempts, including retries.
+_spacy_lock = threading.Lock()
 _spacy_nlp = None
 _spacy_error = None
+_spacy_failed_at: float | None = None  # time.monotonic() of the last failed load
 _phonetic_index = None
 _dictionary = None
 _language_tool = None
@@ -193,78 +201,162 @@ def _get_phonetic_index() -> dict:
     return _phonetic_index
 
 
-def _skip_edit_tree_lemmatizer() -> None:
+# ── spaCy, loaded around the OS's intermittent refusals ────────────────
+# Windows Smart App Control refuses spaCy's unsigned compiled extensions from
+# time to time. The Code Integrity event log shows it happening in bursts that
+# pass: edit_trees for ~30 minutes on 2026-08-11, strings at 13:20 on
+# 2026-09-10, dependencymatcher that night, levenshtein on 2026-09-11 — and
+# every one of them loaded normally afterwards. A refusal is a passing state,
+# not a permanent one, and it causes two different problems:
+#
+#   1. An extension this project never uses is refused. `import spacy` loads
+#      all three below unconditionally (spacy.pipeline pulls in the entity
+#      ruler, which pulls in the matcher package), so one refusal would take the
+#      whole library down for nothing. A placeholder stands in; the refused file
+#      is simply never loaded, and anything that genuinely uses it raises.
+#   2. An extension the pipeline needs is refused — spacy/strings, the
+#      StringStore, was one. Nothing can stand in for that, so the load fails.
+#      Rather than trusting that failure for the life of the process, a request
+#      after _SPACY_RETRY_SECONDS tries again, by when the burst has usually
+#      passed.
+#
+# Neither path touches, or tries to get around, the policy itself.
+
+# The short name Windows reports -> (full module path, the names other spaCy
+# modules import from it). Every importer uses a plain Python `import`, not a
+# `cimport`, which is what lets a Python module stand in.
+_REPLACEABLE_EXTENSIONS = {
+    # The trainable EditTreeLemmatizer. en_core_web_sm uses the rule-based one.
+    "edit_trees": ("spacy.pipeline._edit_tree_internals.edit_trees", ("EditTrees",)),
+    # DependencyMatcher. Nothing here matches on dependency patterns.
+    "dependencymatcher": ("spacy.matcher.dependencymatcher", ("DependencyMatcher",)),
+    # Fuzzy token matching. The attribute ruler's Matcher only calls it for FUZZY
+    # patterns, and en_core_web_sm's rules have none.
+    "levenshtein": (
+        "spacy.matcher.levenshtein",
+        ("levenshtein", "levenshtein_compare", "make_levenshtein_compare"),
+    ),
+}
+
+# How Windows words a refusal: "DLL load failed while importing levenshtein:
+# An Application Control policy has blocked this file."
+_BLOCKED_IMPORT = re.compile(r"while importing (\w+)")
+
+# How long a failed load is trusted before a request tries again. Short enough
+# that a passing burst costs about a minute of checks; long enough that a
+# notepad calling /nlp/check every 800ms can't turn one failure into a stream of
+# full imports.
+_SPACY_RETRY_SECONDS = 60
+
+
+def _purge_spacy_modules() -> None:
+    """Forget every spacy.* module, so the next import is genuinely fresh.
+
+    A failed import leaves half of spaCy cached in sys.modules. Those stale
+    submodules survive a retry but stay bound to the discarded `spacy` module
+    object, so the fresh one never regains its attributes — which broke
+    lemminflect, whose import does `spacy.tokens.Token.set_extension(...)`.
     """
-    Let spaCy import when its edit_trees extension can't be loaded.
-
-    `spacy/pipeline/__init__.py` imports EditTreeLemmatizer unconditionally, and
-    that pulls in a compiled `edit_trees` extension. If the OS refuses to load
-    that one file — Windows Smart App Control blocks unsigned .pyd files, and
-    picked this one — the whole of spaCy becomes unimportable, even though every
-    other extension in the package loads fine.
-
-    en_core_web_sm uses the rule-based `lemmatizer`, never the trainable
-    EditTreeLemmatizer, so registering a placeholder costs us nothing that this
-    project uses: the pipeline still loads tok2vec, tagger, parser,
-    attribute_ruler and lemmatizer, which is everything the checks read.
-
-    This does not work around the block — the blocked file is simply never
-    loaded. Anything that genuinely needs EditTrees raises instead.
-    """
-    import sys
-    import types
-
-    name = "spacy.pipeline._edit_tree_internals.edit_trees"
-    if name in sys.modules:
-        return
-
-    # The failed import leaves half of spaCy cached in sys.modules. Those stale
-    # submodules survive the retry but were bound to the discarded `spacy`
-    # module object, so the fresh one never regains its attributes — which broke
-    # lemminflect, whose import does `spacy.tokens.Token.set_extension(...)`.
-    # Clearing them makes the retry a genuinely fresh import.
     for module in [m for m in sys.modules if m == "spacy" or m.startswith("spacy.")]:
         del sys.modules[module]
 
-    placeholder = types.ModuleType(name)
 
-    class EditTrees:  # pragma: no cover — only reachable if something uses it
+def _placeholder_module(short: str) -> types.ModuleType:
+    """A stand-in for a refused extension. Loads fine; fails loudly only if used."""
+    full_name, names = _REPLACEABLE_EXTENSIONS[short]
+    message = (
+        f"spaCy's {short} extension was refused by Windows Smart App Control when "
+        "this process loaded spaCy, so the feature that needs it is unavailable."
+    )
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError(message)
+
+    class Unavailable:
         def __init__(self, *args, **kwargs):
-            raise RuntimeError(
-                "spaCy's edit_trees extension could not be loaded on this machine, "
-                "so the trainable lemmatizer is unavailable."
-            )
+            raise RuntimeError(message)
 
-    placeholder.EditTrees = EditTrees
-    sys.modules[name] = placeholder
+    module = types.ModuleType(full_name)
+    for name in names:
+        if name == "make_levenshtein_compare":
+            # A registered factory spaCy calls while *building* an entity or span
+            # ruler. Handing back the failing comparator, rather than failing
+            # here, keeps those rulers constructible; only fuzzy matching raises.
+            setattr(module, name, lambda: unavailable)
+        elif name[0].isupper():
+            setattr(module, name, type(name, (Unavailable,), {}))
+        else:
+            setattr(module, name, unavailable)
+    return module
+
+
+def _import_spacy():
+    """`import spacy`, standing in for any replaceable extension the OS refuses.
+
+    Each refusal names one module. If it's on the allowlist, a placeholder takes
+    its place and the import runs again — which can reveal the next refusal, so
+    this loops. It is capped by construction: a module already replaced can't be
+    refused again, so it runs at most once per allowlisted module. Any other
+    ImportError is real, and is raised.
+    """
+    replaced: list[str] = []
+    while True:
+        try:
+            import spacy
+        except ImportError as exc:
+            match = _BLOCKED_IMPORT.search(str(exc))
+            short = match.group(1) if match else None
+            if short not in _REPLACEABLE_EXTENSIONS or short in replaced:
+                raise
+            replaced.append(short)
+            logger.warning(
+                "spaCy's %s extension was refused (%s); standing in a placeholder, "
+                "since this project does not use it.",
+                short,
+                exc,
+            )
+            # The purge takes earlier placeholders with it, so every one so far
+            # is registered again, not just the newest.
+            _purge_spacy_modules()
+            for name in replaced:
+                sys.modules[_REPLACEABLE_EXTENSIONS[name][0]] = _placeholder_module(name)
+            continue
+        return spacy
 
 
 def _get_spacy():
-    """The parsed-language model, or None when spaCy can't be loaded."""
-    global _spacy_nlp, _spacy_error
-    if _spacy_nlp is None and _spacy_error is None:
-        try:
-            try:
-                import spacy
-            except ImportError as exc:
-                # Only retry for the one component we know we can do without;
-                # any other import failure is real and should surface.
-                if "edit_trees" not in str(exc):
-                    raise
-                logger.warning(
-                    "spaCy's edit_trees extension is blocked (%s); loading without "
-                    "the trainable lemmatizer, which this project does not use.",
-                    exc,
-                )
-                _skip_edit_tree_lemmatizer()
-                import spacy
+    """The parsed-language model, or None when spaCy can't be loaded right now."""
+    global _spacy_nlp, _spacy_error, _spacy_failed_at
+    if _spacy_nlp is not None:
+        return _spacy_nlp
 
+    with _spacy_lock:
+        if _spacy_nlp is not None:
+            return _spacy_nlp
+        if (
+            _spacy_failed_at is not None
+            and time.monotonic() - _spacy_failed_at < _SPACY_RETRY_SECONDS
+        ):
+            return None  # failed recently; checks_status() says why
+
+        if _spacy_failed_at is not None:
+            # The last attempt may have left a half-imported spaCy behind.
+            _purge_spacy_modules()
+            logger.info("Retrying the spaCy load after an earlier failure.")
+
+        try:
+            spacy = _import_spacy()
             # The parser is what gives us heads and dependencies for the
             # homophone rules; NER is dead weight here.
             _spacy_nlp = spacy.load("en_core_web_sm", exclude=["ner"])
+            _spacy_error = None
+            _spacy_failed_at = None
         except Exception as exc:  # noqa: BLE001 — missing model, blocked DLL
             _spacy_error = str(exc)
-            logger.warning("Writing checks unavailable: %s", exc)
+            _spacy_failed_at = time.monotonic()
+            logger.warning(
+                "Writing checks unavailable: %s (retrying in %ss)", exc, _SPACY_RETRY_SECONDS
+            )
     return _spacy_nlp
 
 
@@ -341,8 +433,10 @@ def _readiness(resource, error) -> str:
     The distinction the status tuples above can't express is the one /health
     needs: "not yet" and "never" are both `available: False`, but a client
     should wait on the first and stop asking on the second. Every loader here
-    records its failure instead of raising, so a set error means the attempt is
-    over — nothing retries within a process.
+    records its failure instead of raising. For LanguageTool a set error is
+    final for the process. For spaCy it is not: its load is retried after
+    _SPACY_RETRY_SECONDS (see _get_spacy), because the OS refusals behind it
+    pass — so for the checks, 'unavailable' means "not right now".
     """
     if resource is not None:
         return "ready"
