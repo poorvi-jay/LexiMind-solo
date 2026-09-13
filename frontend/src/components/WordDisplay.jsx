@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef } from 'react'
 
+import { splitWordBySyllables, syllableKey } from '../utils/document'
+
 /**
  * Renders words as clickable tokens with:
  *  - Current word highlight (active)
@@ -16,8 +18,13 @@ export default function WordDisplay({
   classifiedWords,
   onWordClick,
   focusRulerEnabled,
+  paragraphStarts = [0],   // word indices where each paragraph begins
+  searchTerms = [],        // normalized search terms to outline
+  syllableView = false,    // show every word split into syllables
+  syllableMap = {},        // cleaned word → ["pho","to","syn","the","sis"]
 }) {
   const activeWordRef = useRef(null)
+  const firstHitRef   = useRef(null)
   const containerRef  = useRef(null)
   const rulerRef      = useRef(null)
   const dimTopRef     = useRef(null)
@@ -105,6 +112,33 @@ export default function WordDisplay({
     }
   }, [activeIndex])
 
+  /* ── Search: which words match, and scroll to the first match ── */
+  const isSearchHit = clean =>
+    searchTerms.length > 0 && clean.length > 0 && searchTerms.some(t => clean.includes(t))
+
+  const firstHitIndex = useMemo(() => {
+    if (!searchTerms.length) return -1
+    return words.findIndex(w => {
+      const clean = String(w || '').toLowerCase().replace(/[^\w']/g, '')
+      return clean.length > 0 && searchTerms.some(t => clean.includes(t))
+    })
+  }, [words, searchTerms])
+
+  useEffect(() => {
+    if (activeIndex < 0 && firstHitRef.current) {
+      firstHitRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }
+  }, [firstHitIndex, words]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* ── Group word indices into paragraphs ── */
+  const paragraphs = useMemo(() => {
+    const starts = paragraphStarts.length ? paragraphStarts : [0]
+    return starts.map((start, p) => {
+      const end = p + 1 < starts.length ? starts[p + 1] : words.length
+      return Array.from({ length: Math.max(0, end - start) }, (_, k) => start + k)
+    }).filter(indices => indices.length)
+  }, [paragraphStarts, words.length])
+
   return (
     <div className="space-y-3">
       {/* ── CHANGE #3: Hard word legend ── */}
@@ -151,44 +185,63 @@ export default function WordDisplay({
           </>
         )}
 
-        {/* Word tokens */}
-        <p className="relative z-10 m-0">
-          {words.map((word, i) => {
-            const isActive   = i === activeIndex
-            const cleanWord  = String(word || '').toLowerCase().replace(/[^\w']/g, '')
-            const label      = classifiedWords[cleanWord]
-            const isHard     = label === 'Hard'
-            const isSentenceActive =
-              activeSentence && i >= activeSentence.start && i <= activeSentence.end
+        {/* Word tokens, one <p> per paragraph (indices stay page-global) */}
+        <div className="relative z-10">
+          {paragraphs.map(indices => (
+            <p key={indices[0]} className="reading-paragraph m-0">
+              {indices.map(i => {
+                const word       = words[i]
+                const isActive   = i === activeIndex
+                const cleanWord  = String(word || '').toLowerCase().replace(/[^\w']/g, '')
+                const label      = classifiedWords[cleanWord]
+                const isHard     = label === 'Hard'
+                const isHit      = isSearchHit(cleanWord)
+                const isSentenceActive =
+                  activeSentence && i >= activeSentence.start && i <= activeSentence.end
 
-            const classes = [
-              'word-token',
-              isActive && 'active',
-              isHard && 'hard-word',
-              isSentenceActive && !isActive && 'sentence-active',
-            ]
-              .filter(Boolean)
-              .join(' ')
+                const classes = [
+                  'word-token',
+                  isActive && 'active',
+                  isHard && 'hard-word',
+                  isHit && 'search-hit',
+                  isSentenceActive && !isActive && 'sentence-active',
+                ]
+                  .filter(Boolean)
+                  .join(' ')
 
-            return (
-              <button
-                key={`${word}-${i}`}
-                ref={isActive ? activeWordRef : null}
-                type="button"
-                onClick={() => onWordClick(word)}
-                className={classes}
-                tabIndex={isHard ? 0 : -1}
-                aria-label={
-                  isHard
-                    ? `${word} — may be challenging, tap for definition`
-                    : `Play word ${word}`
-                }
-              >
-                {word}
-              </button>
-            )
-          })}
-        </p>
+                return (
+                  <button
+                    key={`${word}-${i}`}
+                    ref={isActive ? activeWordRef : i === firstHitIndex ? firstHitRef : null}
+                    type="button"
+                    onClick={() => onWordClick(word)}
+                    className={classes}
+                    tabIndex={isHard || isHit ? 0 : -1}
+                    aria-label={
+                      isHard
+                        ? `${word} — may be challenging, tap for definition`
+                        : `Play word ${word}`
+                    }
+                  >
+                    {syllableView
+                      ? splitWordBySyllables(word, syllableMap[syllableKey(word)])
+                          .map((piece, p, all) => (
+                            <span key={p}>
+                              {/* no dot where the word already breaks itself
+                                  ("light-dependent") */}
+                              {p > 0 && /[a-z']$/i.test(all[p - 1]) && (
+                                <span className="syllable-sep" aria-hidden="true">·</span>
+                              )}
+                              {piece}
+                            </span>
+                          ))
+                      : word}
+                  </button>
+                )
+              })}
+            </p>
+          ))}
+        </div>
       </div>
     </div>
   )

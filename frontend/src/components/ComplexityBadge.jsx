@@ -1,26 +1,17 @@
-const LEVEL_COLORS = {
-  'Easy':      'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-200',
-  'Moderate':  'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-200',
-  'Hard':      'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-200',
-  'Very Hard': 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-200',
-}
-
 /**
  * CHANGE #8: Descriptive stat labels instead of bare numbers
  * CHANGE #9: Estimated reading time clearly shown
+ *
+ * The difficulty level and hard-word percentage were removed deliberately —
+ * a difficulty score can discourage a struggling reader. Hard words are still
+ * highlighted in the text itself.
  */
-export default function ComplexityBadge({ complexity }) {
+export default function ComplexityBadge({ complexity, title = 'This page' }) {
   if (!complexity) return null
 
-  const color = LEVEL_COLORS[complexity.level_label] || 'bg-gray-100 text-gray-700'
-  const mins  = Math.ceil(complexity.est_reading_time_s / 60)
+  const mins = Math.ceil(complexity.est_reading_time_s / 60)
 
   const stats = [
-    {
-      label: 'Hard words',
-      value: `${complexity.hard_word_pct}%`,
-      description: 'of words may be challenging',
-    },
     {
       label: 'Estimated time',
       value: mins === 1 ? '~1 minute' : `~${mins} minutes`,
@@ -38,17 +29,11 @@ export default function ComplexityBadge({ complexity }) {
       className="surface flex flex-col gap-4 rounded-xl border border-gray-200 bg-white
                   p-4 shadow-sm dark:border-gray-700"
       role="status"
-      aria-label={`Text difficulty: ${complexity.level_label}`}
+      aria-label={`${title}: ${complexity.word_count} words`}
     >
-      {/* ── CHANGE #8: Clear "Reading Difficulty" header ── */}
-      <div>
-        <p className="mb-1 text-xs font-medium uppercase tracking-wide text-gray-400">
-          Reading difficulty
-        </p>
-        <span className={`inline-flex rounded-full px-3 py-1 text-sm font-semibold ${color}`}>
-          {complexity.level_label}
-        </span>
-      </div>
+      <p className="text-xs font-medium uppercase tracking-wide text-gray-400">
+        {title}
+      </p>
 
       {/* ── CHANGE #8 + #9: Descriptive stat rows ── */}
       <div className="space-y-2.5">

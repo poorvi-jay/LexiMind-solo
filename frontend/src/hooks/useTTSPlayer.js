@@ -1,311 +1,338 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { api } from '../utils/api'
 
-export function useTTSPlayer(onWordChange) {
+const VOICE = 'en-GB-SoniaNeural'
+
+// Small first chunk so audio starts fast; later chunks are fetched while
+// the current one plays. Char cap keeps every chunk under the backend's
+// 1000-char TTS limit so nothing is silently cut off.
+const FIRST_CHUNK_WORDS = 12
+const CHUNK_WORDS       = 40
+const MAX_CHUNK_WORDS   = 60
+const MAX_CHUNK_CHARS   = 900
+const PREFETCH_AHEAD    = 2
+const MAX_CACHE         = 30
+const SPEED_DEBOUNCE_MS = 350
+
+/** Split words[startIndex..] into chunks, preferring sentence ends. */
+function buildChunks(words, startIndex) {
+  const chunks = []
+  let i = startIndex
+  while (i < words.length) {
+    const target = chunks.length === 0 ? FIRST_CHUNK_WORDS : CHUNK_WORDS
+    const start = i
+    let chars = 0
+    while (i < words.length) {
+      chars += words[i].length + 1
+      i++
+      const count = i - start
+      if (count >= MAX_CHUNK_WORDS || chars >= MAX_CHUNK_CHARS) break
+      if (count >= target && /[.!?]["')\]]*$/.test(words[i - 1])) break
+      if (count >= target * 1.5) break
+    }
+    chunks.push({ start, text: words.slice(start, i).join(' ') })
+  }
+  return chunks
+}
+
+function base64ToBlob(b64) {
+  const binary = atob(b64)
+  const bytes  = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return new Blob([bytes], { type: 'audio/mpeg' })
+}
+
+/**
+ * @param onWordChange(globalIndex) — highlight callback (-1 = none)
+ * @param onEnded() — fired only when the last chunk finishes naturally
+ *                    (not on stop, error, or restart)
+ */
+export function useTTSPlayer(onWordChange, onEnded) {
   const [isPlaying, setIsPlaying]             = useState(false)
   const [isPaused, setIsPaused]               = useState(false)
   const [isLoading, setIsLoading]             = useState(false)
   const [error, setError]                     = useState(null)
   const [totalDurationMs, setTotalDurationMs] = useState(0)
 
-  const audioRef      = useRef(null)
-  const timingsRef    = useRef([])
-  const wordIndexRef  = useRef(-1)
-  const baseIndexRef  = useRef(0)
-  const rafRef        = useRef(null)
-  const scaleRef      = useRef(1)
+  const audioRef       = useRef(null)
+  const timingsRef     = useRef([])
+  const timeoutRefs    = useRef([])
+  const wordIndexRef   = useRef(-1)   // global index of highlighted word
+  const cacheRef       = useRef(new Map())
+  const sessionRef     = useRef(0)    // bumps on every start/stop to cancel stale work
+  const wordsRef       = useRef([])
+  const chunksRef      = useRef([])
+  const chunkIdxRef    = useRef(0)
+  const speedRef       = useRef(1.0)
+  const pausesRef      = useRef(true)
+  const activeRef      = useRef(false)
+  const pausedRef      = useRef(false)
+  const restartRef     = useRef(false) // speed changed while paused
+  const speedTimerRef  = useRef(null)
+  const onWordRef      = useRef(onWordChange)
+  const playChunkRef   = useRef(null)   // lets onended recurse into playChunk
 
-  /* ══════════════════════════════════════════════
-     SCALE FACTOR
-     ══════════════════════════════════════════════ */
-  const computeScale = useCallback(() => {
-    const audio   = audioRef.current
-    const timings = timingsRef.current
+  const onEndedRef     = useRef(onEnded)
 
-    if (!audio || !timings.length || !isFinite(audio.duration) || audio.duration === 0) {
-      scaleRef.current = 1
-      return
-    }
+  useEffect(() => { onWordRef.current = onWordChange }, [onWordChange])
+  useEffect(() => { onEndedRef.current = onEnded }, [onEnded])
 
-    const audioDurationMs = audio.duration * 1000
-    const last            = timings[timings.length - 1]
-    const lastEndMs       = (last.start_ms || 0) + (last.duration_ms || 0)
-
-    if (lastEndMs <= 0) {
-      scaleRef.current = 1
-      return
-    }
-
-    scaleRef.current = audioDurationMs / lastEndMs
-
-    console.log(
-      `[TTS sync] audio: ${Math.round(audioDurationMs)}ms, ` +
-      `timings span: ${Math.round(lastEndMs)}ms → ` +
-      `scale: ${scaleRef.current.toFixed(3)}`
-    )
+  const setWord = useCallback((i) => {
+    wordIndexRef.current = i
+    onWordRef.current(i)
   }, [])
 
   /* ══════════════════════════════════════════════
-     SYNC ENGINE
+     FETCH (cached, shared by play + prefetch)
      ══════════════════════════════════════════════ */
-  const findWordIndex = useCallback((timings, timingMs) => {
-    let lo = 0
-    let hi = timings.length - 1
-    let result = -1
+  const fetchChunk = useCallback((text, speed, phrasePauses) => {
+    const key   = `${text}|${speed}|${phrasePauses}`
+    const cache = cacheRef.current
+    if (cache.has(key)) return cache.get(key)
 
-    while (lo <= hi) {
-      const mid = (lo + hi) >>> 1
-      if (timings[mid].start_ms <= timingMs) {
-        result = mid
-        lo = mid + 1
-      } else {
-        hi = mid - 1
-      }
-    }
-    return result
+    const promise = api.post('/tts/generate', {
+      text, speed, voice: VOICE, phrase_pauses: phrasePauses,
+    }).then(data => ({
+      blob: base64ToBlob(data.audio_b64),
+      word_timings: data.word_timings || [],
+      duration_ms: data.duration_ms || 0,
+    }))
+    promise.catch(() => cache.delete(key))
+
+    cache.set(key, promise)
+    if (cache.size > MAX_CACHE) cache.delete(cache.keys().next().value)
+    return promise
   }, [])
 
-  const startSync = useCallback(() => {
-    if (rafRef.current) cancelAnimationFrame(rafRef.current)
-
-    const tick = () => {
-      const audio   = audioRef.current
-      const timings = timingsRef.current
-      const scale   = scaleRef.current
-
-      if (!audio || audio.paused || !timings.length) {
-        rafRef.current = null
-        return
-      }
-
-      const audioMs  = audio.currentTime * 1000
-      const timingMs = scale > 0 ? audioMs / scale : audioMs
-      const wordIdx  = findWordIndex(timings, timingMs)
-
-      if (wordIdx !== wordIndexRef.current) {
-        wordIndexRef.current = wordIdx
-        onWordChange(wordIdx >= 0 ? baseIndexRef.current + wordIdx : -1)
-
-      }
-
-      rafRef.current = requestAnimationFrame(tick)
+  const prefetchFrom = useCallback((fromChunk) => {
+    const chunks = chunksRef.current
+    for (let c = fromChunk; c < Math.min(chunks.length, fromChunk + PREFETCH_AHEAD); c++) {
+      fetchChunk(chunks[c].text, speedRef.current, pausesRef.current).catch(() => {})
     }
-
-    rafRef.current = requestAnimationFrame(tick)
-  }, [findWordIndex, onWordChange])
-
-  const stopSync = useCallback(() => {
-    if (rafRef.current) {
-      cancelAnimationFrame(rafRef.current)
-      rafRef.current = null
-    }
-  }, [])
+  }, [fetchChunk])
 
   /* ══════════════════════════════════════════════
-     RELEASE — tear down the current element safely
+     SYNC — setTimeout chain anchored to play start
      ══════════════════════════════════════════════ */
-  const releaseAudio = useCallback(() => {
+  const clearSync = useCallback(() => {
+    timeoutRefs.current.forEach(clearTimeout)
+    timeoutRefs.current = []
+  }, [])
+
+  const scheduleSync = useCallback((timings, audioStartTime, baseIndex) => {
+    clearSync()
+    timings.forEach((t, i) => {
+      const delay = t.start_ms - (Date.now() - audioStartTime)
+      if (delay >= 0) {
+        const id = setTimeout(() => setWord(baseIndex + i), delay)
+        timeoutRefs.current.push(id)
+      }
+    })
+  }, [clearSync, setWord])
+
+  /** Highlight the word already under the playhead (used on resume). */
+  const syncToCurrentTime = useCallback((baseIndex) => {
     const audio = audioRef.current
     if (!audio) return
+    const ms = audio.currentTime * 1000
+    const timings = timingsRef.current
+    let idx = -1
+    for (let i = 0; i < timings.length && timings[i].start_ms <= ms; i++) idx = i
+    if (idx >= 0) setWord(baseIndex + idx)
+  }, [setWord])
 
-    // Detach the handlers first. Revoking a blob URL while the element still
-    // points at it makes the element fire `error`, and a stale handler would
-    // then tear down whatever playback has started in the meantime — flipping
-    // the UI back to "Play" and killing the new highlight loop mid-sentence.
-    audio.onended = null
-    audio.onerror = null
-    audio.onstalled = null
-
-    audio.pause()
-
-    const src = audio.src
-    audio.removeAttribute('src')
-    audio.load() // resets the element so it lets go of the blob
-    if (src) URL.revokeObjectURL(src)
-
-    audioRef.current = null
-  }, [])
-
-  /* ══════════════════════════════════════════════
-     PLAY — fixed: no double src assignment
-     ══════════════════════════════════════════════ */
-  const play = useCallback(async (text, speed = 1.0, phrasePauses = true, prefetched = null, baseIndex = 0) => {
-    try {
-      setIsLoading(true)
-      setError(null)
-      setIsPaused(false)
-      stopSync()
-
-      
-
-      releaseAudio()
-
-      let blob, wordTimings, durationMs
-
-      if (prefetched) {
-        blob        = prefetched.blob
-        wordTimings = prefetched.word_timings
-        durationMs  = prefetched.duration_ms || 0
-      } else {
-        const data = await api.post('/tts/generate', {
-          text,
-          speed,
-          voice: 'en-GB-SoniaNeural',
-          phrase_pauses: phrasePauses,
-        })
-
-        const binary = atob(data.audio_b64)
-        const bytes  = new Uint8Array(binary.length)
-        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-        blob        = new Blob([bytes], { type: 'audio/mpeg' })
-        wordTimings = data.word_timings
-        durationMs  = data.duration_ms || 0
-      }
-
-      // Log for debugging
-      console.log(`[TTS] received ${wordTimings?.length || 0} word timings`)
-      if (wordTimings?.length > 0) {
-        console.log(`[TTS] first word: "${wordTimings[0].word}" at ${wordTimings[0].start_ms}ms`)
-        const last = wordTimings[wordTimings.length - 1]
-        console.log(`[TTS] last word: "${last.word}" at ${last.start_ms}ms`)
-      }
-
-      const url = URL.createObjectURL(blob)
-
-      // ── FIX: Create Audio WITHOUT url, then set src once ──
-      const audio = new Audio()
-
-      audioRef.current     = audio
-      timingsRef.current   = wordTimings || []
-      wordIndexRef.current = -1
-      baseIndexRef.current = baseIndex
-      scaleRef.current     = 1
-      setTotalDurationMs(durationMs)
-
-      // Wait for metadata before playing
-      const metadataReady = new Promise((resolve) => {
-        audio.addEventListener('loadedmetadata', () => {
-          console.log(`[TTS] audio duration from metadata: ${audio.duration}s`)
-          resolve()
-        }, { once: true })
-      })
-
-      // Handle canplaythrough for extra safety
-      const canPlay = new Promise((resolve) => {
-        audio.addEventListener('canplaythrough', resolve, { once: true })
-      })
-
-      audio.addEventListener('durationchange', () => {
-        console.log(`[TTS] duration changed to: ${audio.duration}s`)
-        computeScale()
-      })
-
-      // Set src ONCE and load
-      audio.src = url
-      audio.preload = 'auto'
-      audio.load()
-
-      // Wait for at least metadata
-      await metadataReady
-
-      // Also wait for canplaythrough to avoid early stop
-      await canPlay
-
-      computeScale()
-
-      // Both handlers bail out if this element has since been replaced, so a
-      // late event from a superseded playback can't disturb the current one.
-      audio.onended = () => {
-        if (audioRef.current !== audio) return
-        console.log('[TTS] audio ended naturally')
-        stopSync()
-        wordIndexRef.current = -1
-        baseIndexRef.current = 0
-        setIsPlaying(false)
-        setIsPaused(false)
-        onWordChange(-1)
-        URL.revokeObjectURL(url)
-      }
-
-      audio.onerror = (e) => {
-        if (audioRef.current !== audio) return
-        console.error('[TTS] audio error:', e)
-        stopSync()
-        setError('Audio playback failed')
-        setIsPlaying(false)
-        setIsLoading(false)
-        URL.revokeObjectURL(url)
-      }
-
-      // Also catch stall/suspend
-      audio.onstalled = () => {
-        console.warn('[TTS] audio stalled — network issue?')
-      }
-
-      setIsLoading(false)
-      setIsPlaying(true)
-
-      await audio.play()
-      console.log(`[TTS] playback started, duration: ${audio.duration}s`)
-
-      computeScale()
-      startSync()
-    } catch (err) {
-      console.error('[TTS] play error:', err)
-      setError(err.message)
-      setIsLoading(false)
-      setIsPlaying(false)
+  const releaseAudio = useCallback(() => {
+    clearSync()
+    const audio = audioRef.current
+    if (audio) {
+      audio.onended = null
+      audio.onerror = null
+      audio.pause()
+      if (audio.src) URL.revokeObjectURL(audio.src)
+      audioRef.current = null
     }
-  }, [stopSync, startSync, computeScale, onWordChange, releaseAudio])
+  }, [clearSync])
 
-  /* ══════════════════════════════════════════════
-     PAUSE / RESUME / STOP
-     ══════════════════════════════════════════════ */
-  const pause = useCallback(() => {
-    if (audioRef.current) audioRef.current.pause()
-    stopSync()
-    setIsPlaying(false)
-    setIsPaused(true)
-  }, [stopSync])
-
-  const resume = useCallback(async () => {
-    if (!audioRef.current || !isPaused) return
-    try {
-      await audioRef.current.play()
-      startSync()
-      setIsPlaying(true)
-      setIsPaused(false)
-    } catch (err) {
-      setError(err.message)
-    }
-  }, [isPaused, startSync])
-
-  const stop = useCallback(() => {
-    stopSync()
+  const finish = useCallback(() => {
     releaseAudio()
-    timingsRef.current   = []
-    wordIndexRef.current = -1
-    baseIndexRef.current = 0
-    scaleRef.current     = 1
+    activeRef.current  = false
+    pausedRef.current  = false
+    restartRef.current = false
+    timingsRef.current = []
     setIsPlaying(false)
     setIsPaused(false)
+    setIsLoading(false)
+    setWord(-1)
+  }, [releaseAudio, setWord])
+
+  /* ══════════════════════════════════════════════
+     CHUNK PLAYBACK
+     ══════════════════════════════════════════════ */
+  const playChunk = useCallback(async (session, chunkIdx) => {
+    const chunks = chunksRef.current
+    if (chunkIdx >= chunks.length) {
+      finish()
+      onEndedRef.current?.()
+      return
+    }
+    const chunk = chunks[chunkIdx]
+    chunkIdxRef.current = chunkIdx
+    prefetchFrom(chunkIdx + 1)
+
+    const data = await fetchChunk(chunk.text, speedRef.current, pausesRef.current)
+    if (sessionRef.current !== session) return
+
+    releaseAudio()
+    const url   = URL.createObjectURL(data.blob)
+    const audio = new Audio(url)
+    audioRef.current   = audio
+    timingsRef.current = data.word_timings
+
+    if (chunkIdx === 0) {
+      const chunkWords = chunk.text.split(/\s+/).length
+      const totalLeft  = wordsRef.current.length - chunks[0].start
+      setTotalDurationMs(Math.round((data.duration_ms / chunkWords) * totalLeft))
+    }
+
+    audio.onended = () => {
+      if (sessionRef.current !== session) return
+      playChunkRef.current(session, chunkIdx + 1).catch(err => {
+        if (sessionRef.current !== session) return
+        setError(err.message)
+        finish()
+      })
+    }
+    audio.onerror = () => {
+      if (sessionRef.current !== session) return
+      setError('Audio playback failed')
+      finish()
+    }
+
+    // Paused while this chunk was loading — stay paused; resume() plays it.
+    if (pausedRef.current) {
+      setIsLoading(false)
+      return
+    }
+
+    await audio.play()
+    if (sessionRef.current !== session) return
+    // Anchor AFTER play() resolves — this is when sound actually starts.
+    const audioStartTime = Date.now() - audio.currentTime * 1000
+
+    setIsLoading(false)
+    setIsPlaying(true)
+    scheduleSync(data.word_timings, audioStartTime, chunk.start)
+  }, [fetchChunk, prefetchFrom, releaseAudio, scheduleSync, finish])
+
+  useEffect(() => { playChunkRef.current = playChunk }, [playChunk])
+
+  const startFrom = useCallback(async (startIndex) => {
+    const session = ++sessionRef.current
+    releaseAudio()
+    activeRef.current  = true
+    pausedRef.current  = false
+    restartRef.current = false
+    chunksRef.current  = buildChunks(wordsRef.current, startIndex)
+    setError(null)
+    setIsPaused(false)
+    setIsLoading(true)
+
+    try {
+      await playChunk(session, 0)
+    } catch (err) {
+      if (sessionRef.current !== session) return
+      console.error('[TTS] play error:', err)
+      setError(err.message)
+      finish()
+    }
+  }, [releaseAudio, playChunk, finish])
+
+  /* ══════════════════════════════════════════════
+     PUBLIC API
+     ══════════════════════════════════════════════ */
+  const play = useCallback((words, speed = 1.0, phrasePauses = true, startIndex = 0) => {
+    wordsRef.current  = words
+    speedRef.current  = speed
+    pausesRef.current = phrasePauses
+    setWord(-1)
+    return startFrom(startIndex)
+  }, [startFrom, setWord])
+
+  /** Warm the cache for the first chunks so Play starts instantly. */
+  const prefetch = useCallback((words, speed = 1.0, phrasePauses = true) => {
+    if (!words.length) return
+    buildChunks(words, 0).slice(0, PREFETCH_AHEAD).forEach(c => {
+      fetchChunk(c.text, speed, phrasePauses).catch(() => {})
+    })
+  }, [fetchChunk])
+
+  const pause = useCallback(() => {
+    if (audioRef.current) audioRef.current.pause()
+    clearSync()
+    pausedRef.current = true
+    setIsPlaying(false)
+    setIsPaused(true)
+  }, [clearSync])
+
+  const resume = useCallback(async () => {
+    if (!pausedRef.current) return
+    if (restartRef.current || !audioRef.current) {
+      const from = Math.max(wordIndexRef.current, chunksRef.current[chunkIdxRef.current]?.start ?? 0)
+      return startFrom(from)
+    }
+    const session = sessionRef.current
+    const chunk   = chunksRef.current[chunkIdxRef.current]
+    try {
+      await audioRef.current.play()
+      if (sessionRef.current !== session) return
+      const audio = audioRef.current
+      pausedRef.current = false
+      syncToCurrentTime(chunk.start)
+      scheduleSync(timingsRef.current, Date.now() - audio.currentTime * 1000, chunk.start)
+      setIsPlaying(true)
+      setIsPaused(false)
+    } catch (err) {
+      setError(err.message)
+    }
+  }, [startFrom, scheduleSync, syncToCurrentTime])
+
+  const stop = useCallback(() => {
+    sessionRef.current++
+    clearTimeout(speedTimerRef.current)
+    finish()
     setTotalDurationMs(0)
-    onWordChange(-1)
-  }, [stopSync, onWordChange, releaseAudio])
+  }, [finish])
+
+  /**
+   * Mid-session speed change: stop current audio, regenerate from the
+   * current word at the new speed, and re-anchor sync. Debounced so a
+   * slider drag triggers one regeneration, not one per step.
+   */
+  const changeSpeed = useCallback((newSpeed) => {
+    speedRef.current = newSpeed
+    clearTimeout(speedTimerRef.current)
+    if (!activeRef.current) return
+
+    if (pausedRef.current) {
+      restartRef.current = true
+      return
+    }
+
+    speedTimerRef.current = setTimeout(() => {
+      if (!activeRef.current || pausedRef.current) return
+      const chunkStart = chunksRef.current[chunkIdxRef.current]?.start ?? 0
+      startFrom(Math.max(wordIndexRef.current, chunkStart))
+    }, SPEED_DEBOUNCE_MS)
+  }, [startFrom])
 
   /* ══════════════════════════════════════════════
      PLAY SINGLE WORD
      ══════════════════════════════════════════════ */
   const playWord = useCallback(async (word) => {
     try {
-      const data   = await api.post('/tts/word', { word, voice: 'en-GB-SoniaNeural' })
-      const binary = atob(data.audio_b64)
-      const bytes  = new Uint8Array(binary.length)
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-      const blob  = new Blob([bytes], { type: 'audio/mpeg' })
-      const a     = new Audio()
-      a.src = URL.createObjectURL(blob)
+      const data = await api.post('/tts/word', { word, voice: VOICE })
+      const a    = new Audio(URL.createObjectURL(base64ToBlob(data.audio_b64)))
       a.onended = () => URL.revokeObjectURL(a.src)
       a.play()
     } catch (err) {
@@ -313,25 +340,18 @@ export function useTTSPlayer(onWordChange) {
     }
   }, [])
 
-  const getCurrentWordIndex = useCallback(() => {
-    if (wordIndexRef.current >= 0) {
-      return baseIndexRef.current + wordIndexRef.current
-    }
+  const getCurrentWordIndex = useCallback(() => wordIndexRef.current, [])
 
-    // The rAF sync loop may not have ticked yet. Derive the position from the
-    // audio clock instead, so callers never mistake "not tracked yet" for
-    // "at the very beginning" and rewind the whole passage.
-    const audio   = audioRef.current
-    const timings = timingsRef.current
-    if (!audio || !timings.length) return -1
-
-    const scale = scaleRef.current > 0 ? scaleRef.current : 1
-    const index = findWordIndex(timings, (audio.currentTime * 1000) / scale)
-    return index >= 0 ? baseIndexRef.current + index : -1
-  }, [findWordIndex])
+  // Stop audio and pending highlight timeouts when the page unmounts.
+  useEffect(() => () => {
+    sessionRef.current++
+    clearTimeout(speedTimerRef.current)
+    timeoutRefs.current.forEach(clearTimeout)
+    if (audioRef.current) audioRef.current.pause()
+  }, [])
 
   return {
-    play, pause, resume, stop, playWord, getCurrentWordIndex,
+    play, pause, resume, stop, playWord, prefetch, changeSpeed, getCurrentWordIndex,
     isPlaying, isPaused, isLoading, error, totalDurationMs,
   }
 }

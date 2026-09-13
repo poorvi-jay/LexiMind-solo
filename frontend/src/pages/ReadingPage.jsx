@@ -2,14 +2,19 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import ComplexityBadge from '../components/ComplexityBadge.jsx'
 import DefinitionPanel from '../components/DefinitionPanel.jsx'
+import DocumentNavigator from '../components/DocumentNavigator.jsx'
+import PageNav from '../components/PageNav.jsx'
 import ReadingProgress from '../components/ReadingProgress.jsx'
 import { Toast } from '../components/Toast.jsx'
 import WordDisplay from '../components/WordDisplay.jsx'
 import { api } from '../utils/api'
+import {
+  normalizeWord, pageLayout, pagesFromPdf, pagesFromText, searchTerms, splitWords,
+  syllableKey,
+} from '../utils/document'
 import { usePrefs } from '../context/PreferencesContext'
-import { useTTSPlayer } from '../hooks/useTTSPlayer'
-import { useTTSPrefetch } from '../hooks/useTTSPrefetch'
 import { useReadingSession } from '../hooks/useReadingSession'
+import { useTTSPlayer } from '../hooks/useTTSPlayer'
 import { useToast } from '../hooks/useToast.js'
 
 const SAMPLE_TEXT =
@@ -17,158 +22,191 @@ const SAMPLE_TEXT =
   'Renewable technology helps communities reduce pollution. ' +
   'These innovations make clean power available to people around the world.'
 
-function normalizeWord(word) {
-  return String(word || '').toLowerCase().replace(/[^\w']/g, '')
-}
+const CLASSIFY_BATCH = 5000 // /classify max_length (backend/routers/classify.py)
+
 export default function ReadingPage() {
   const { prefs } = usePrefs()
   const { toast, showToast, hideToast } = useToast()
 
-  const [text, setText]                   = useState('')
-  const [words, setWords]                 = useState([])
+  // Document: pages of { number, text }; text holds paragraphs split by "\n\n".
+  const [pages, setPages]                 = useState([])
+  const [pageIndex, setPageIndex]         = useState(0)
+  const [originals, setOriginals]         = useState({})  // pageIndex → text before Simplify
+  const [simplifiedInfo, setSimplifiedInfo] = useState({}) // pageIndex → simplify response
+  const [query, setQuery]                 = useState('')
+
   const [activeIndex, setActiveIndex]     = useState(-1)
   const [classifiedWords, setClassified]  = useState({})
   const [complexity, setComplexity]       = useState(null)
-  const [simplified, setSimplified]       = useState(null)
-  const [originalText, setOriginalText]   = useState('')
   const [selectedWord, setSelectedWord]   = useState(null)
   const [speed, setSpeed]                 = useState(1.0)
   const [isSimplifying, setIsSimplifying] = useState(false)
   const [isUploading, setIsUploading]     = useState(false)
   const [distractionFree, setDistraction] = useState(false)
-  const [classificationReady, setClassificationReady] = useState(false)
-  // True while handlePlay is generating audio, before play() takes over isLoading.
-  const [isPreparing, setIsPreparing] = useState(false)
-  // Where the loaded text came from, logged with each reading session (F37).
-  const [sourceType, setSourceType] = useState('paste')
+  const [syllableView, setSyllableView]   = useState(false)
+  const [syllableMap, setSyllableMap]     = useState({})  // cleaned word → syllables
 
-  // Store the raw word_timings so we can use backend's word list
-  const [wordTimings, setWordTimings]     = useState([])
-  const classifyRequestRef = useRef(0)
-  const { prefetch, getCached, clearCache } = useTTSPrefetch()
+  const [sourceType, setSourceType] = useState('paste')
+  // The pages read in the current session, and how many words came before the
+  // current one: useReadingSession follows a single running word index, while
+  // activeIndex restarts at 0 on every page.
+  const [sessionPages, setSessionPages]   = useState([])
+  const [sessionOffset, setSessionOffset] = useState(0)
+  // True while reading is paused only because a word's definition is open.
+  const pausedForDefinitionRef = useRef(false)
+
+  // Classification: words already sent to /classify for this document.
+  const docVersionRef   = useRef(0)
+  const classifyTriedRef = useRef(new Set())
+
+  const currentPage = pages[pageIndex]
+  const currentText = currentPage?.text ?? ''
+  const { words, paragraphStarts } = useMemo(() => pageLayout(currentText), [currentText])
 
   const {
-    play, pause, resume, stop, playWord, getCurrentWordIndex,
+    play, pause, resume, stop, playWord, prefetch, changeSpeed,
     isPlaying, isPaused, isLoading,
     error: ttsError, totalDurationMs,
-  } = useTTSPlayer(useCallback(i => setActiveIndex(i), []))
+  } = useTTSPlayer(useCallback(i => setActiveIndex(i), []), handleReadingEnded)
+
+  const isAudioActive = isPlaying || isPaused
+  const hasText = pages.some(p => p.text.trim())
+
+  /* ── Session reporting (F37) — everything read since Play was pressed ── */
+  const sessionWords = useMemo(
+    () => sessionPages.flatMap(i => splitWords(pages[i]?.text ?? '')),
+    [sessionPages, pages],
+  )
+  const sessionHardWords = useMemo(
+    () => sessionWords.filter(w => classifiedWords[normalizeWord(w)] === 'Hard').length,
+    [sessionWords, classifiedWords],
+  )
+
+  const { recordReplay, end: endSession } = useReadingSession({
+    isPlaying, isPaused,
+    // Auto-advancing to the next page stops one audio and starts the next in
+    // the same tick; isLoading covers that gap so it isn't read as the session
+    // ending. A speed change is covered the same way.
+    isPreparing: isLoading,
+    activeIndex: activeIndex >= 0 ? sessionOffset + activeIndex : -1,
+    totalWords: sessionWords.length,
+    hardWordCount: sessionHardWords,
+    sourceType,
+    simplified: sessionPages.some(i => simplifiedInfo[i]),
+    complexityScore: complexity?.flesch_kincaid_grade ?? null,
+  })
+
+  const resetSession = useCallback(() => {
+    setSessionPages([])
+    setSessionOffset(0)
+  }, [])
 
   useEffect(() => {
     if (ttsError) showToast(`Could not play audio: ${ttsError}`, 'error')
   }, [ttsError, showToast])
 
-    useEffect(() => {
-    function handleKeyDown(e) {
-      if (e.key === 'Escape' && distractionFree) {
-        setDistraction(false)
-      }
-    }
-
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [distractionFree])
-
+  // Warm the first TTS chunks once typing settles so Play starts instantly.
   useEffect(() => {
-    // Skip while audio is active or being generated. Changing speed mid-playback
-    // re-runs this, and regenerating the whole passage is wasted work when
-    // handleSpeedChange only needs the remaining words. isPreparing matters
-    // because that handler calls stop() first, which clears isPlaying before
-    // this effect gets a chance to run. Prefetching resumes once playback ends.
-    if (isPlaying || isPaused || isPreparing) return
-    if (text.trim()) prefetch(text.trim(), speed, prefs.phrasePauses)
-  }, [text, speed, prefs.phrasePauses, prefetch, isPlaying, isPaused, isPreparing])
+    if (!words.length || isPlaying || isPaused) return
+    const id = setTimeout(() => prefetch(words, speed, prefs.phrasePauses), 600)
+    return () => clearTimeout(id)
+  }, [words, speed, prefs.phrasePauses, prefetch, isPlaying, isPaused])
 
-  /* ── FIX #3: When TTS data arrives, rebuild words from timings ── */
-  const displayWords = useMemo(() => {
-    // If we have word timings, use THOSE words so indices match exactly
-    if (wordTimings.length > 0) {
-      return wordTimings.map(t => t.word)
-    }
-    // Fallback to split
-    return words
-  }, [wordTimings, words])
+  // While a page plays, warm the next page so auto-advance has no gap.
+  useEffect(() => {
+    if (!isPlaying || !pages[pageIndex + 1]) return
+    prefetch(splitWords(pages[pageIndex + 1].text), speed, prefs.phrasePauses)
+  }, [isPlaying, pageIndex, pages, speed, prefs.phrasePauses, prefetch])
 
-  const totalWords = displayWords.length
+  /* ── Complexity of the current page — not shown to the reader (a difficulty
+     score can be discouraging); kept only for the session log / analytics ── */
+  useEffect(() => {
+    const text = currentText.trim()
+    if (!text) return
+    let cancelled = false
+    const id = setTimeout(() => {
+      api.post('/reading/complexity', { text })
+        .then(data => { if (!cancelled) setComplexity(data) })
+        .catch(() => {})
+    }, 500)
+    return () => { cancelled = true; clearTimeout(id) }
+  }, [currentText])
 
-  // Hard words in the loaded text, counted by token — what the reader sees
-  // highlighted. Feeds both the complexity badge and the session log.
-  const hardWordCount = useMemo(() => {
-    if (!classificationReady) return 0
-    return words.filter(word => classifiedWords[normalizeWord(word)] === 'Hard').length
-  }, [classificationReady, words, classifiedWords])
+  /* ── Syllable breakdowns for the current page (only while the view is on) ── */
+  useEffect(() => {
+    if (!syllableView || !words.length) return
+    const missing = [...new Set(words.map(syllableKey).filter(Boolean))]
+      .filter(w => !(w in syllableMap))
+    if (!missing.length) return
+    let cancelled = false
+    api.post('/reading/syllabify', { words: missing })
+      .then(data => { if (!cancelled) setSyllableMap(prev => ({ ...prev, ...data.results })) })
+      .catch(() => {
+        if (!cancelled) showToast('Could not load syllable breakdown.', 'warning')
+      })
+    return () => { cancelled = true }
+  }, [syllableView, words, syllableMap, showToast])
 
-  const { recordReplay, end: endSession } = useReadingSession({
-    isPlaying, isPaused, isPreparing,
-    activeIndex, totalWords, hardWordCount,
-    sourceType,
-    simplified: simplified !== null,
-    complexityScore: complexity?.flesch_kincaid_grade ?? null,
-  })
+  /* ── Classify words not yet labelled, across all pages (debounced) ── */
+  useEffect(() => {
+    const version = docVersionRef.current
+    const id = setTimeout(() => {
+      const tried = classifyTriedRef.current
+      // Labels are keyed by normalized word, so classify each unique word once.
+      const missing = [...new Set(
+        pages.flatMap(p => splitWords(p.text)).map(normalizeWord).filter(Boolean),
+      )].filter(w => !tried.has(w))
+      if (!missing.length) return
+      missing.forEach(w => tried.add(w))
 
-  /* ── Load text ── */
-  function loadText(raw, options = {}) {
-  // Different text is a different session: report the one that is ending.
-  endSession()
-  // Keep the origin across edits, simplification and restore — fixing a few
-  // OCR mistakes doesn't turn a scanned page into pasted text. Only text typed
-  // into an empty box counts as a paste.
-  if (options.source) setSourceType(options.source)
-  else if (!text.trim()) setSourceType('paste')
+      // /classify rejects > 5000 words (422), so long documents go in batches.
+      const batches = []
+      for (let i = 0; i < missing.length; i += CLASSIFY_BATCH) {
+        batches.push(missing.slice(i, i + CLASSIFY_BATCH))
+      }
+      Promise.all(batches.map(batch => api.post('/classify', { words: batch })))
+        .then(responses => {
+          if (docVersionRef.current !== version) return
+          const labels = {}
+          responses.flatMap(data => data.results || []).forEach(item => {
+            const clean = normalizeWord(item.word)
+            if (clean) labels[clean] = item.label
+          })
+          setClassified(prev => ({ ...prev, ...labels }))
+        })
+        .catch(error => console.error('Could not classify hard words:', error))
+    }, 500)
+    return () => clearTimeout(id)
+  }, [pages])
 
-  const cleaned = raw.trim()
-  setText(raw)
-  setActiveIndex(-1)
-  setWordTimings([])
-
-  if (!cleaned) {
-    setWords([])
+  /* ── Load a new document ── */
+  function loadDocument(nextPages, nextSourceType) {
+    if (isPlaying || isPaused || isLoading) handleStop()
+    docVersionRef.current += 1
+    classifyTriedRef.current = new Set()
     setClassified({})
-    setClassificationReady(false)
-    setComplexity(null)
-    setSimplified(null)
-    setOriginalText('')
-    clearCache()
-    return
+    setPages(nextPages)
+    setPageIndex(0)
+    setOriginals({})
+    setSimplifiedInfo({})
+    setQuery('')
+    setActiveIndex(-1)
+    setSourceType(nextSourceType)
   }
 
-  const nextWords = cleaned.split(/\s+/).filter(w => w.length > 0)
-  setWords(nextWords)
-  setOriginalText(options.originalText ?? cleaned)
-  setSimplified(options.simplified ?? null)
-  setClassified({})
-  setClassificationReady(false)
+  /* ── Edit the current page's text ── */
+  function updatePageText(index, text) {
+    // New text invalidates the playing audio's word indices — stop it.
+    if (isPlaying || isPaused || isLoading) handleStop()
+    setPages(prev => prev.map((p, i) => (i === index ? { ...p, text } : p)))
+    setActiveIndex(-1)
+  }
 
-  const classifyRequestId = classifyRequestRef.current + 1
-  classifyRequestRef.current = classifyRequestId
-
-    api
-      .post('/reading/complexity', { text: cleaned })
-      .then(setComplexity)
-      .catch(() => showToast('Could not calculate complexity.', 'warning'))
-
-    api
-  .post('/classify', { words: nextWords })
-  .then(data => {
-    if (classifyRequestRef.current !== classifyRequestId) return
-
-    const classified = {}
-
-    ;(data.results || []).forEach(item => {
-      const cleanWord = normalizeWord(item.word)
-      if (cleanWord) classified[cleanWord] = item.label
-    })
-
-    setClassified(classified)
-    setClassificationReady(true)
-  })
-  .catch(error => {
-    if (classifyRequestRef.current !== classifyRequestId) return
-
-    console.error('Could not classify hard words:', error)
-    setClassified({})
-    setClassificationReady(true)
-  })
-
+  function goToPage(index) {
+    if (index < 0 || index >= pages.length || index === pageIndex) return
+    if (isPlaying || isPaused || isLoading) handleStop()
+    setPageIndex(index)
+    setActiveIndex(-1)
   }
 
   /* ── File upload ── */
@@ -188,10 +226,18 @@ export default function ReadingPage() {
     try {
       const formData = new FormData()
       formData.append('file', file)
-      const endpoint = file.type === 'application/pdf' ? '/ocr/pdf' : '/ocr/image'
-      const data = await api.postForm(endpoint, formData)
-      loadText(data.text, { source: file.type === 'application/pdf' ? 'pdf' : 'image' })
-      showToast(`Extracted ${data.word_count} words.`, 'success')
+      const isPdf = file.type === 'application/pdf'
+      const data = await api.postForm(isPdf ? '/ocr/pdf' : '/ocr/image', formData)
+      const nextPages = isPdf
+        ? pagesFromPdf(data.page_texts ?? [data.text])
+        : pagesFromText(data.text)
+      if (!nextPages.length) {
+        showToast('Could not extract text. Please try a clearer file.', 'error')
+        return
+      }
+      loadDocument(nextPages, isPdf ? 'pdf' : 'image')
+      const pageNote = nextPages.length > 1 ? ` across ${nextPages.length} pages` : ''
+      showToast(`Extracted ${data.word_count} words${pageNote}.`, 'success')
     } catch (err) {
       showToast(err.message, 'error')
     } finally {
@@ -200,18 +246,23 @@ export default function ReadingPage() {
     }
   }
 
-  /* ── Simplify ── */
+  /* ── Simplify the current page ── */
   async function handleSimplify() {
-    if (!text.trim()) return
-    const sourceText = text.trim()
+    const index = pageIndex
+    const sourceText = currentText.trim()
+    if (!sourceText) return
     setIsSimplifying(true)
     try {
       const data = await api.post('/reading/simplify', { text: sourceText })
-      loadText(data.simplified_text, {
-        originalText: originalText || sourceText,
-        simplified: data,
-      })
-      showToast('Text simplified.', 'success')
+      // Never replace the user's notes with an empty result.
+      if (!data?.simplified_text?.trim()) {
+        showToast('Simplification unavailable. Your original text is unchanged.', 'warning')
+        return
+      }
+      setOriginals(prev => ({ ...prev, [index]: prev[index] ?? currentText }))
+      setSimplifiedInfo(prev => ({ ...prev, [index]: data }))
+      updatePageText(index, data.simplified_text)
+      showToast(pages.length > 1 ? `Page ${currentPage.number} simplified.` : 'Text simplified.', 'success')
     } catch (error) {
       showToast(error?.message || 'Simplification unavailable.', 'warning')
     } finally {
@@ -220,154 +271,164 @@ export default function ReadingPage() {
   }
 
   function handleRestore() {
-    loadText(originalText)
+    const index = pageIndex
+    if (originals[index] == null) return
+    updatePageText(index, originals[index])
+    setOriginals(prev => { const next = { ...prev }; delete next[index]; return next })
+    setSimplifiedInfo(prev => { const next = { ...prev }; delete next[index]; return next })
     showToast('Original text restored.', 'info')
   }
 
   function handleWordClick(word) {
     const clean = normalizeWord(word)
     if (!clean) return
+    // Pause reading so the definition and word audio don't talk over it;
+    // handleDefinitionClose resumes it.
+    if (isPlaying) {
+      pauseReading()
+      pausedForDefinitionRef.current = true
+    }
     setSelectedWord(clean)
     // Asking to hear a word again is what the repeat log counts (F41, F49).
     recordReplay(clean)
     playWord(clean)
   }
 
-  /* ── Play — also capture word_timings for display sync ── */
-  async function handlePlay() {
-    if (isPreparing) return // a generation is already running
+  /* ── Play — the player chunks the page's word list, so indices match WordDisplay ── */
+  function handlePlay() {
+    setSessionPages(prev => (prev.includes(pageIndex) ? prev : [...prev, pageIndex]))
+    play(words, speed, prefs.phrasePauses)
+  }
 
-    const trimmed = text.trim()
-    const cached = getCached(trimmed, speed, prefs.phrasePauses)
-
-    // Capture word timings for display word sync
-    if (cached?.word_timings) {
-      setWordTimings(cached.word_timings)
-      console.log(`[ReadingPage] Using ${cached.word_timings.length} cached timing words`)
-      play(trimmed, speed, prefs.phrasePauses, cached)
-      return
+  /* ── A page finished: continue onto the next page, or end the session ── */
+  function handleReadingEnded() {
+    const next = pageIndex + 1
+    if (next < pages.length) {
+      setSessionOffset(offset => offset + words.length)
+      setSessionPages(prev => (prev.includes(next) ? prev : [...prev, next]))
+      setPageIndex(next)
+      setActiveIndex(-1)
+      play(splitWords(pages[next].text), speed, prefs.phrasePauses)
+    } else {
+      endSession()
+      resetSession()
     }
+  }
 
-    // Nothing prefetched yet, so generate now. On a long passage this takes
-    // several seconds, and play() — which owns isLoading — isn't reached until
-    // it resolves. Without a loading state of its own the Play button stays
-    // live the whole time, and a second click starts a rival playback that
-    // yanks the audio back to the beginning mid-sentence.
-    setIsPreparing(true)
-    try {
-      const data = await api.post('/tts/generate', {
-        text: trimmed,
-        speed,
-        voice: 'en-GB-SoniaNeural',
-        phrase_pauses: prefs.phrasePauses,
-      })
+  // No paused-time bookkeeping here: useReadingSession banks time only while
+  // isPlaying is true, so a pause is simply never counted.
+  function pauseReading() {
+    pause()
+  }
 
-      const binary = atob(data.audio_b64)
-      const bytes  = new Uint8Array(binary.length)
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-      const blob = new Blob([bytes], { type: 'audio/mpeg' })
-
-      const prefetchedData = {
-        blob,
-        word_timings: data.word_timings,
-        duration_ms: data.duration_ms || 0,
-      }
-
-      if (data.word_timings) {
-        setWordTimings(data.word_timings)
-        console.log(`[ReadingPage] Using ${data.word_timings.length} fresh timing words`)
-      }
-
-      // play() sets isLoading synchronously, so the button stays disabled
-      // without a gap when isPreparing clears below.
-      play(trimmed, speed, prefs.phrasePauses, prefetchedData)
-    } catch (err) {
-      showToast(err.message, 'error')
-    } finally {
-      setIsPreparing(false)
-    }
+  function resumeReading() {
+    resume()
   }
 
   function handlePauseResume() {
-    if (isPaused) resume()
-    else pause()
+    pausedForDefinitionRef.current = false
+    if (isPaused) resumeReading()
+    else pauseReading()
+  }
+
+  /* ── Closing the definition resumes reading if a word click paused it ── */
+  function handleDefinitionClose() {
+    setSelectedWord(null)
+    if (pausedForDefinitionRef.current && isPaused) resumeReading()
+    pausedForDefinitionRef.current = false
   }
 
   function handleStop() {
-    // Ended explicitly: Stop pressed while paused never passes through the
-    // playing -> stopped transition that useReadingSession watches for.
+    pausedForDefinitionRef.current = false
+    // Stop while paused never passes through the playing -> stopped transition
+    // useReadingSession watches for, so the session is ended explicitly here.
     endSession()
+    resetSession()
     stop()
-    setWordTimings([])
     setActiveIndex(-1)
   }
 
-  async function handleSpeedChange(nextSpeed) {
+  function handleSpeedChange(nextSpeed) {
     setSpeed(nextSpeed)
-
-    if (!isPlaying) return
-
-    // Only resume from a position we actually know. Falling back to 0 here
-    // meant an untracked position replayed the entire passage from the top —
-    // which reads as "it started over" a few lines in.
-    const currentIndex = Math.max(getCurrentWordIndex(), activeIndex)
-    if (currentIndex < 0) return
-
-    const sourceWords = showWords.length > 0 ? showWords : words
-    const remainingText = sourceWords.slice(currentIndex).join(' ')
-
-    if (!remainingText.trim()) return
-
-    // Marked as preparing for the same reasons as handlePlay: it keeps the
-    // Play button — which stop() briefly brings back — from starting a rival
-    // playback, and it stops the prefetch effect regenerating the whole passage.
-    setIsPreparing(true)
-    try {
-      stop()
-      setWordTimings([])
-      await play(remainingText, nextSpeed, prefs.phrasePauses, null, currentIndex)
-    } finally {
-      setIsPreparing(false)
-    }
+    changeSpeed(nextSpeed)
   }
 
-  const hasText = displayWords.length > 0 || words.length > 0
-  const showWords = displayWords.length > 0 ? displayWords : words
-  const isAudioActive = isPlaying || isPaused
+  /* ── Keyboard: Escape leaves focus mode; ← / → change page ── */
+  useEffect(() => {
+    function handleKeyDown(e) {
+      if (e.key === 'Escape' && distractionFree) {
+        setDistraction(false)
+        return
+      }
+      const typing = e.target.closest?.('input, textarea, select, [contenteditable="true"]')
+      if (typing || selectedWord || e.altKey || e.ctrlKey || e.metaKey) return
+      if (e.key === 'ArrowRight') goToPage(pageIndex + 1)
+      if (e.key === 'ArrowLeft') goToPage(pageIndex - 1)
+    }
 
-  const classifierHardWordPct = useMemo(() => {
-    if (!classificationReady || words.length === 0) return null
-    return Math.round((hardWordCount / words.length) * 100)
-  }, [classificationReady, words, hardWordCount])
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  })
 
-  const displayedComplexity = useMemo(() => {
-    if (!complexity || classifierHardWordPct === null) return complexity
-    return { ...complexity, hard_word_pct: classifierHardWordPct }
-  }, [complexity, classifierHardWordPct])
+  const activeSearchTerms = useMemo(
+    () => (query.trim().length >= 2 ? searchTerms(query) : []),
+    [query],
+  )
+
+  const isMultiPage = pages.length > 1
+  const pageSimplified = simplifiedInfo[pageIndex]
+
+  const readingColumn = (
+    <>
+      <PageNav pages={pages} pageIndex={pageIndex} onChange={goToPage} />
+      <WordDisplay
+        words={words}
+        paragraphStarts={paragraphStarts}
+        activeIndex={activeIndex}
+        classifiedWords={classifiedWords}
+        onWordClick={handleWordClick}
+        focusRulerEnabled={prefs.focusRuler}
+        searchTerms={activeSearchTerms}
+        syllableView={syllableView}
+        syllableMap={syllableMap}
+      />
+      <ReadingProgress
+        activeIndex={activeIndex}
+        totalWords={words.length}
+        durationMs={totalDurationMs}
+      />
+      {isMultiPage && words.length > 150 && (
+        <PageNav pages={pages} pageIndex={pageIndex} onChange={goToPage} />
+      )}
+    </>
+  )
 
   return (
     <main
       className={
         distractionFree
           ? 'min-h-screen p-4 pb-28'
-          : 'min-h-screen bg-gray-50/70 px-4 py-8 pb-28 dark:bg-[#1E1E1E] sm:px-6'
+          : 'min-h-screen bg-gray-50/70 px-4 py-6 pb-28 dark:bg-[#1E1E1E] sm:px-6'
       }
     >
       {/* ════════════ NORMAL MODE ════════════ */}
       {!distractionFree && (
-        <section className="mx-auto max-w-6xl">
-          {/* Page header */}
-          <div className="mb-8">
+        <section className="mx-auto max-w-[1440px]">
+          {/* Page header — compact once a document is open */}
+          <div className={hasText ? 'mb-5' : 'mb-8'}>
             <p className="text-sm font-semibold uppercase tracking-wide text-blue-600 dark:text-blue-300">
               Reading workspace
             </p>
-            <h1 className="mt-2 text-3xl font-bold tracking-tight text-gray-950 dark:text-white sm:text-4xl">
+            <h1 className={`mt-1 font-bold tracking-tight text-gray-950 dark:text-white
+              ${hasText ? 'text-2xl' : 'text-3xl sm:text-4xl'}`}>
               Read, listen, and understand.
             </h1>
-            <p className="mt-3 max-w-2xl text-base leading-relaxed text-gray-600 dark:text-gray-300">
-              Upload your notes, simplify hard passages, listen with word-by-word
-              highlighting, and tap any word for its meaning.
-            </p>
+            {!hasText && (
+              <p className="mt-3 max-w-2xl text-base leading-relaxed text-gray-600 dark:text-gray-300">
+                Upload your notes, simplify hard passages, listen with word-by-word
+                highlighting, and tap any word for its meaning.
+              </p>
+            )}
           </div>
 
           {/* ════════════ EMPTY STATE ════════════ */}
@@ -426,7 +487,7 @@ export default function ReadingPage() {
 
                 <button
                   type="button"
-                  onClick={() => loadText(SAMPLE_TEXT, { source: 'sample' })}
+                  onClick={() => loadDocument(pagesFromText(SAMPLE_TEXT), 'sample')}
                   className="group flex flex-col items-center gap-3
                               rounded-2xl border border-gray-200 bg-gray-50 p-6
                               transition-colors hover:border-blue-300 hover:bg-blue-50
@@ -447,19 +508,56 @@ export default function ReadingPage() {
                               focus:border-blue-400 focus:outline-none
                               dark:border-gray-700 dark:bg-[#333]"
                   placeholder="Or paste your text here…"
-                  value={text}
-                  onChange={e => loadText(e.target.value)}
+                  value=""
+                  onChange={e => loadDocument(pagesFromText(e.target.value), 'paste')}
                   aria-label="Paste your reading text"
                 />
               </div>
             </div>
           )}
 
-          {/* ════════════ READING LAYOUT ════════════ */}
+          {/* ════════════ READING LAYOUT ════════════
+              xl:  [pages + search] [reading] [tools]
+              lg:  [reading] [pages + search / tools stacked]
+              <lg: reading, then pages/search, then tools */}
           {hasText && (
-            <div className="grid gap-6 lg:grid-cols-[280px_1fr]">
-              {/* Left sidebar */}
-              <aside className="space-y-4 lg:sticky lg:top-24 lg:self-start">
+            <div
+              className={`grid gap-5 ${isMultiPage
+                ? 'lg:grid-cols-[minmax(0,1fr)_300px] xl:grid-cols-[260px_minmax(0,1fr)_320px]'
+                : 'lg:grid-cols-[minmax(0,1fr)_320px]'}`}
+            >
+              {isMultiPage && (
+                <aside
+                  className="order-2 lg:order-none lg:col-start-2 lg:row-start-1
+                              xl:sticky xl:top-20 xl:col-start-1 xl:self-start"
+                  aria-label="Pages and search"
+                >
+                  <DocumentNavigator
+                    pages={pages}
+                    pageIndex={pageIndex}
+                    onSelectPage={goToPage}
+                    query={query}
+                    onQueryChange={setQuery}
+                  />
+                </aside>
+              )}
+
+              <section
+                className={`order-1 min-w-0 space-y-4 lg:order-none lg:col-start-1 lg:row-start-1
+                  ${isMultiPage ? 'lg:row-span-2 xl:col-start-2 xl:row-span-1' : ''}`}
+                aria-label="Reading content"
+              >
+                {readingColumn}
+              </section>
+
+              {/* Tools: upload, edit this page, simplify, complexity */}
+              <aside
+                className={`order-3 space-y-4 lg:order-none lg:col-start-2 lg:self-start
+                  ${isMultiPage
+                    ? 'lg:row-start-2 xl:sticky xl:top-20 xl:col-start-3 xl:row-start-1'
+                    : 'lg:sticky lg:top-20 lg:row-start-1'}`}
+                aria-label="Tools"
+              >
                 <div
                   className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm
                               dark:border-gray-800 dark:bg-[#2A2A2A]"
@@ -479,7 +577,7 @@ export default function ReadingPage() {
                     </label>
                     <button
                       type="button"
-                      onClick={() => loadText(SAMPLE_TEXT, { source: 'sample' })}
+                      onClick={() => loadDocument(pagesFromText(SAMPLE_TEXT), 'sample')}
                       className="rounded-lg border border-gray-200 px-3 py-2 text-xs
                                   font-semibold text-gray-600 hover:bg-gray-50
                                   dark:border-gray-700 dark:text-gray-300"
@@ -490,31 +588,31 @@ export default function ReadingPage() {
 
                   <label
                     className="text-xs font-semibold text-gray-500 dark:text-gray-400"
-                    htmlFor="sidebar-text"
+                    htmlFor="page-editor"
                   >
-                    Edit text
+                    {isMultiPage ? `Edit page ${currentPage.number}` : 'Edit text'}
                   </label>
                   <textarea
-                    id="sidebar-text"
-                    className="surface mt-1 min-h-24 w-full resize-y rounded-xl border
-                                border-gray-200 bg-white p-3 text-xs shadow-inner
+                    id="page-editor"
+                    className="surface mt-1 min-h-[16rem] w-full resize-y rounded-xl border
+                                border-gray-200 bg-white p-3 text-sm leading-relaxed shadow-inner
                                 focus:border-blue-400 focus:outline-none
                                 dark:border-gray-700"
-                    value={text}
-                    onChange={e => loadText(e.target.value)}
+                    value={currentText}
+                    onChange={e => updatePageText(pageIndex, e.target.value)}
                   />
 
                   <div className="mt-3 flex flex-wrap gap-2">
                     <button
                       type="button"
                       onClick={handleSimplify}
-                      disabled={!hasText || isSimplifying}
+                      disabled={!currentText.trim() || isSimplifying}
                       className="rounded-lg bg-purple-600 px-3 py-2 text-xs font-semibold
                                   text-white hover:bg-purple-700 disabled:opacity-50"
                     >
-                      {isSimplifying ? 'Simplifying…' : '✨ Simplify'}
+                      {isSimplifying ? 'Simplifying…' : isMultiPage ? '✨ Simplify this page' : '✨ Simplify'}
                     </button>
-                    {simplified && (
+                    {pageSimplified && (
                       <button
                         type="button"
                         onClick={handleRestore}
@@ -528,36 +626,24 @@ export default function ReadingPage() {
                   </div>
                 </div>
 
-                {displayedComplexity && <ComplexityBadge complexity={displayedComplexity} />}
+                {complexity && currentText.trim() && (
+                  <ComplexityBadge
+                    complexity={complexity}
+                    title={isMultiPage ? `Page ${currentPage.number}` : 'This text'}
+                  />
+                )}
 
-                {simplified && (
+                {pageSimplified && (
                   <div
                     className="rounded-xl border border-purple-100 bg-purple-50 p-3
                                 text-xs text-purple-800
                                 dark:border-purple-900 dark:bg-purple-950/40 dark:text-purple-200"
                   >
-                    Hard words reduced from {simplified.original_hard_word_pct}%
-                    to {simplified.simplified_hard_word_pct}%.
+                    This page has been rewritten in simpler words. Use Restore to
+                    bring back the original.
                   </div>
                 )}
               </aside>
-
-              {/* Right: reading content */}
-              <section className="space-y-4" aria-label="Reading content">
-                <WordDisplay
-                  words={showWords}
-                  activeIndex={activeIndex}
-                  classifiedWords={classifiedWords}
-                  onWordClick={handleWordClick}
-                  focusRulerEnabled={prefs.focusRuler}
-                />
-
-                <ReadingProgress
-                  activeIndex={activeIndex}
-                  totalWords={showWords.length}
-                  durationMs={totalDurationMs}
-                />
-              </section>
             </div>
           )}
         </section>
@@ -566,23 +652,12 @@ export default function ReadingPage() {
       {/* ════════════ DISTRACTION-FREE MODE ════════════ */}
       {distractionFree && hasText && (
         <section className="distraction-free mx-auto max-w-3xl space-y-4">
-          <WordDisplay
-            words={showWords}
-            activeIndex={activeIndex}
-            classifiedWords={classifiedWords}
-            onWordClick={handleWordClick}
-            focusRulerEnabled={prefs.focusRuler}
-          />
-          <ReadingProgress
-            activeIndex={activeIndex}
-            totalWords={showWords.length}
-            durationMs={totalDurationMs}
-          />
+          {readingColumn}
         </section>
       )}
 
       {/* ═══════════════════════════════════════════════════
-          FIX #2: STICKY PLAYBACK TOOLBAR — always visible
+          STICKY PLAYBACK TOOLBAR — always visible
           ═══════════════════════════════════════════════════ */}
       {hasText && (
         <div
@@ -598,12 +673,12 @@ export default function ReadingPage() {
               <button
                 type="button"
                 onClick={handlePlay}
-                disabled={isLoading || isPreparing}
+                disabled={isLoading || !words.length}
                 className="rounded-xl bg-blue-600 px-6 py-2.5 text-sm font-bold
                             text-white shadow-md shadow-blue-200 hover:bg-blue-700
                             disabled:opacity-50 dark:shadow-none"
               >
-                {isLoading || isPreparing ? 'Loading…' : '▶  Play'}
+                {isLoading ? 'Loading…' : '▶  Play'}
               </button>
             ) : (
               <button
@@ -630,6 +705,19 @@ export default function ReadingPage() {
               ⏹ Stop
             </button>
 
+            {/* Syllable view toggle */}
+            <button
+              type="button"
+              onClick={() => setSyllableView(!syllableView)}
+              aria-pressed={syllableView}
+              className={`rounded-xl border px-4 py-2 text-xs font-semibold
+                ${syllableView
+                  ? 'border-blue-300 bg-blue-50 text-blue-700 dark:border-blue-700 dark:bg-blue-950/50 dark:text-blue-200'
+                  : 'border-gray-200 text-gray-600 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-800'}`}
+            >
+              {syllableView ? '✓ Syl·la·bles' : 'Syl·la·bles'}
+            </button>
+
             {/* Focus toggle */}
             <button
               type="button"
@@ -641,10 +729,15 @@ export default function ReadingPage() {
               {distractionFree ? '← Exit Focus' : '🎯 Focus'}
             </button>
 
-            {/* Current word indicator */}
-            {isAudioActive && activeIndex >= 0 && activeIndex < showWords.length && (
+            {/* Current page / word indicator */}
+            {isMultiPage && (
+              <span className="hidden text-xs font-semibold text-gray-500 dark:text-gray-400 md:inline">
+                Page {currentPage.number}
+              </span>
+            )}
+            {isAudioActive && activeIndex >= 0 && activeIndex < words.length && (
               <div className="current-word-display ml-2 hidden sm:flex" aria-live="polite">
-                {showWords[activeIndex]?.replace(/[^a-zA-Z']/g, '') || ''}
+                {words[activeIndex]?.replace(/[^a-zA-Z']/g, '') || ''}
               </div>
             )}
 
@@ -676,8 +769,8 @@ export default function ReadingPage() {
               <div
                 className="reading-progress-fill rounded-none"
                 style={{
-                  width: `${showWords.length > 0
-                    ? Math.round(((activeIndex + 1) / showWords.length) * 100)
+                  width: `${words.length > 0
+                    ? Math.round(((activeIndex + 1) / words.length) * 100)
                     : 0}%`
                 }}
               />
@@ -687,7 +780,11 @@ export default function ReadingPage() {
       )}
 
       {/* Definition panel */}
-      <DefinitionPanel word={selectedWord} onClose={() => setSelectedWord(null)} />
+      <DefinitionPanel
+        word={selectedWord}
+        onClose={handleDefinitionClose}
+        onPlayWord={playWord}
+      />
 
       {toast && <Toast message={toast.message} type={toast.type} onClose={hideToast} />}
     </main>

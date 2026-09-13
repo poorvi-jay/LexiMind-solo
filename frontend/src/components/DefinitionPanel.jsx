@@ -10,7 +10,7 @@ import { api } from '../utils/api'
  *   definition, phonetic, syllables, example
  * We also handle optional: synonyms, pronunciation (alias for phonetic)
  */
-export default function DefinitionPanel({ word, onClose }) {
+export default function DefinitionPanel({ word, onClose, onPlayWord }) {
   const [definition, setDefinition] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -92,6 +92,19 @@ export default function DefinitionPanel({ word, onClose }) {
                 {definition.phonetic}
               </p>
             )}
+
+            {onPlayWord && (
+              <button
+                type="button"
+                onClick={() => onPlayWord(word)}
+                className="mt-3 inline-flex min-h-[44px] items-center gap-2 rounded-xl
+                            bg-blue-600 px-4 text-sm font-semibold text-white
+                            hover:bg-blue-700 focus-visible:outline-2
+                            focus-visible:outline-offset-2 focus-visible:outline-blue-500"
+              >
+                <span aria-hidden="true">🔊</span> Hear it again
+              </button>
+            )}
           </div>
           <button
             type="button"
@@ -125,15 +138,30 @@ export default function DefinitionPanel({ word, onClose }) {
           {/* Definition data */}
           {definition && (
             <div className="space-y-5">
-              {/* Syllable breakdown */}
-              {!!definition.syllables && (
+              {/* Syllable breakdown — "chlo · ro · plasts" */}
+              {(definition.syllable_parts?.length > 0 || !!definition.syllables) && (
                 <section className="rounded-xl border border-gray-200 bg-gray-50 p-4 dark:border-gray-700 dark:bg-[#333]">
                   <p className="text-xs font-semibold uppercase tracking-wide text-gray-400">
                     Syllables
                   </p>
-                  <p className="mt-2 text-base tracking-wider text-gray-800 dark:text-gray-100">
-                    {definition.syllables}
-                  </p>
+                  {definition.syllable_parts?.length > 0 ? (
+                    <p className="mt-2 text-xl font-semibold tracking-wide text-gray-800 dark:text-gray-100">
+                      {definition.syllable_parts.map((part, i) => (
+                        <span key={i}>
+                          {i > 0 && <span className="syllable-sep" aria-hidden="true">·</span>}
+                          {part}
+                        </span>
+                      ))}
+                      <span className="ml-2 align-middle text-xs font-normal text-gray-400">
+                        {definition.syllable_parts.length}{' '}
+                        {definition.syllable_parts.length === 1 ? 'syllable' : 'syllables'}
+                      </span>
+                    </p>
+                  ) : (
+                    <p className="mt-2 text-base tracking-wider text-gray-800 dark:text-gray-100">
+                      {definition.syllables}
+                    </p>
+                  )}
                 </section>
               )}
 
