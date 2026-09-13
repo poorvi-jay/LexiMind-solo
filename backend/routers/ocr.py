@@ -29,5 +29,8 @@ async def ocr_pdf(
     pdf_bytes = await file.read()
     if len(pdf_bytes) > 10_000_000:
         raise HTTPException(413, "File too large. Maximum 10 MB allowed.")
-    text, pages = await ocr_service.extract_from_pdf(pdf_bytes)
-    return {"text": text, "word_count": len(text.split()), "pages": pages}
+    page_texts, pages = await ocr_service.extract_from_pdf(pdf_bytes)
+    text = "\n".join(page_texts)
+    # page_texts is additive: existing clients keep using text/word_count/pages.
+    return {"text": text, "word_count": len(text.split()), "pages": pages,
+            "page_texts": page_texts}

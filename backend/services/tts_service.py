@@ -61,11 +61,21 @@ def get_mp3_duration_ms(audio_bytes: bytes) -> int:
         data = audio_bytes
         length = len(data)
 
-        bitrate_table = [
+        # Layer III tables. edge-tts emits MPEG-2 (24 kHz, 48 kbps), so
+        # MPEG-2/2.5 must be handled, not just MPEG-1.
+        bitrate_mpeg1 = [
             0, 32, 40, 48, 56, 64, 80, 96,
             112, 128, 160, 192, 224, 256, 320, 0,
         ]
-        sample_rate_table = [44100, 48000, 32000, 0]
+        bitrate_mpeg2 = [
+            0, 8, 16, 24, 32, 40, 48, 56,
+            64, 80, 96, 112, 128, 144, 160, 0,
+        ]
+        sample_rates = {
+            3: [44100, 48000, 32000],  # MPEG-1
+            2: [22050, 24000, 16000],  # MPEG-2
+            0: [11025, 12000, 8000],   # MPEG-2.5
+        }
 
         frame_count = 0
         while i < length - 4:
@@ -76,18 +86,21 @@ def get_mp3_duration_ms(audio_bytes: bytes) -> int:
                 sr_idx = (data[i + 2] >> 2) & 0x03
 
                 if (
-                    version == 3
+                    version in sample_rates
                     and layer == 1
                     and 0 < bitrate_idx < 15
                     and sr_idx < 3
                 ):
-                    bitrate = bitrate_table[bitrate_idx] * 1000
-                    sample_rate = sample_rate_table[sr_idx]
+                    is_mpeg1 = version == 3
+                    table = bitrate_mpeg1 if is_mpeg1 else bitrate_mpeg2
+                    bitrate = table[bitrate_idx] * 1000
+                    sample_rate = sample_rates[version][sr_idx]
+                    samples = 1152 if is_mpeg1 else 576
                     padding = (data[i + 2] >> 1) & 0x01
-                    frame_size = (144 * bitrate // sample_rate) + padding
+                    frame_size = (samples // 8 * bitrate // sample_rate) + padding
 
                     if frame_size > 0:
-                        duration_ms += 1152 * 1000 / sample_rate
+                        duration_ms += samples * 1000 / sample_rate
                         i += frame_size
                         frame_count += 1
                         continue
@@ -152,6 +165,17 @@ def map_boundaries_to_display_words(
     for display_word in display_words:
         display_clean = re.sub(r'[^a-zA-Z0-9]', '', display_word).lower()
 
+        # Pure punctuation ("—", "&") has no spoken boundary. Share the
+        # previous word's timing instead of consuming the next boundary,
+        # which would shift every later word by one.
+        if not display_clean:
+            prev = timings[-1] if timings else None
+            start = prev["end_ms"] if prev else (
+                int(raw_boundaries[b_idx]["offset_ms"]) if b_idx < len(raw_boundaries) else 0
+            )
+            timings.append({"word": display_word, "start_ms": start, "end_ms": start})
+            continue
+
         if b_idx >= len(raw_boundaries):
             last_end = timings[-1]["end_ms"] if timings else 0
             timings.append({
@@ -199,7 +223,11 @@ async def _run_edge_tts(text: str, tts_text: str, speed: float, voice: str):
     display_words = split_words_for_timing(text.strip())
 
     rate = speed_to_rate(speed)
-    communicate = edge_tts.Communicate(tts_text, voice, rate=rate)
+    # edge-tts >= 7 defaults to SentenceBoundary; without WordBoundary we
+    # get no per-word offsets and fall back to estimated (drifting) timings.
+    communicate = edge_tts.Communicate(
+        tts_text, voice, rate=rate, boundary="WordBoundary"
+    )
 
     audio_chunks = []
     raw_boundaries = []
