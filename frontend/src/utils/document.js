@@ -122,22 +122,39 @@ export function paginateText(text, target = PAGE_TARGET_WORDS) {
   return pages.map((t, i) => ({ number: i + 1, text: t }))
 }
 
+const HEADER_REPEAT_RATIO = 0.6  // share of pages a line must repeat on
+const HEADER_MAX_CHARS    = 80   // a running header is a label, not a sentence
+const HEADER_MAX_PER_PAGE = 4    // a page has a header and a footer, not a body
+
 /**
- * Remove running headers/footers: a line among the first/last two lines of
- * a page that repeats on at least 60% of pages (digits ignored, so
- * "Page 3 of 9" matches "Page 4 of 9").
+ * Remove running headers/footers: a line that repeats on at least 60% of
+ * pages (digits ignored, so "Page 3 of 9" matches "Page 4 of 9") and is
+ * either among the first/last two lines of its page, or short enough to be a
+ * header rather than body text.
+ *
+ * The short-line rule matters because a PDF's text layer comes out in the
+ * order the page's blocks were drawn, not in reading order: a header printed
+ * at the top of the page routinely arrives after the body text, several lines
+ * from either edge. Requiring an edge left it sitting inside a paragraph on
+ * 25 of the 29 pages of a real set of notes.
  */
 function stripRunningHeaders(pageTexts) {
   if (pageTexts.length < 3) return pageTexts
-  const key = line => line.trim().replace(/\d+/g, '#')
-  const edgeLines = text => {
+  const key     = line => line.trim().replace(/\d+/g, '#')
+  const isShort = line => line.trim().length <= HEADER_MAX_CHARS
+  // What a page can contribute, counted once each: both edges whatever their
+  // length, plus every short line wherever it sits.
+  const candidates = text => {
     const lines = text.split('\n').filter(l => l.trim())
-    return [...new Set([...lines.slice(0, 2), ...lines.slice(-2)].map(key))]
+    const edges = [...lines.slice(0, 2), ...lines.slice(-2)]
+    return [...new Set([...edges, ...lines.filter(isShort)].map(key))]
   }
   const counts = new Map()
-  pageTexts.forEach(t => edgeLines(t).forEach(k => counts.set(k, (counts.get(k) || 0) + 1)))
+  pageTexts.forEach(t => candidates(t).forEach(k => counts.set(k, (counts.get(k) || 0) + 1)))
   const repeated = new Set(
-    [...counts].filter(([k, n]) => k && n >= pageTexts.length * 0.6).map(([k]) => k)
+    [...counts]
+      .filter(([k, n]) => k && n >= pageTexts.length * HEADER_REPEAT_RATIO)
+      .map(([k]) => k)
   )
   if (!repeated.size) return pageTexts
   return pageTexts.map(text => {
@@ -145,7 +162,18 @@ function stripRunningHeaders(pageTexts) {
     const edge = new Set()
     const nonBlank = lines.map((l, i) => (l.trim() ? i : -1)).filter(i => i >= 0)
     ;[...nonBlank.slice(0, 2), ...nonBlank.slice(-2)].forEach(i => edge.add(i))
-    return lines.filter((l, i) => !(edge.has(i) && repeated.has(key(l)))).join('\n')
+
+    let drop = new Set(
+      lines.map((l, i) => (repeated.has(key(l)) && (edge.has(i) || isShort(l)) ? i : -1))
+        .filter(i => i >= 0),
+    )
+    // More than a header and a footer — or more than half the page — means the
+    // page's own text repeats across the document (a form, a table of the same
+    // rows). Fall back to the edges only, so a page is never emptied by this.
+    if (drop.size > HEADER_MAX_PER_PAGE || drop.size * 2 > nonBlank.length) {
+      drop = new Set([...drop].filter(i => edge.has(i)))
+    }
+    return lines.filter((l, i) => !drop.has(i)).join('\n')
   })
 }
 
