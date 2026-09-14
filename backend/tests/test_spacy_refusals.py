@@ -22,6 +22,16 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SENTENCE = "Their going too the libary tomorow"
 
+# Smart App Control is a Windows feature. The import hook that simulates it
+# would still run on Linux, but it would be simulating a refusal the OS there
+# cannot produce — two minutes of a CI job spent proving nothing. Skipping
+# with a reason (pytest -rs prints it) keeps that visible rather than silent.
+pytestmark = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="Smart App Control is Windows-only; the loader it exercises is a "
+    "local-development workaround, not a deployed-environment concern.",
+)
+
 HEADER = r'''
 import importlib.abc, json, sys
 sys.path.insert(0, REPO)

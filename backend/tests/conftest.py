@@ -13,6 +13,9 @@ The API base comes from LEXIMIND_API, defaulting to port 8000:
 
     set LEXIMIND_API=http://127.0.0.1:8001   # when 8000 is taken
 
+CI sets LEXIMIND_REQUIRE_API=1, which turns those skips into failures — a
+suite that silently stops covering the API is worse than one that goes red.
+
 Integration tests register throwaway accounts and write to the configured
 database. Point them at a development database, never a real one.
 """
@@ -36,6 +39,27 @@ if str(REPO_ROOT) not in sys.path:
 API_BASE = os.getenv("LEXIMIND_API", "http://127.0.0.1:8000")
 TEST_PASSWORD = "TestPassw0rd!23"
 
+# CI sets this; a developer never does. See _unavailable().
+REQUIRE_API = os.getenv("LEXIMIND_REQUIRE_API") == "1"
+
+
+def _unavailable(reason: str):
+    """Skip for a developer, fail for CI.
+
+    A skipped integration test is the right default locally: a fresh clone
+    with nothing running should still go green. In CI it is exactly wrong —
+    the whole point of the job is that these ran, and a skip would report
+    success having exercised only the unit tests. LEXIMIND_REQUIRE_API=1
+    turns every reason-the-backend-isn't-there into a failure instead.
+
+    Never returns; both branches raise.
+    """
+    if REQUIRE_API:
+        # pytrace=False: the traceback would point at this helper, which says
+        # nothing useful. The reason string is the whole message.
+        pytest.fail(reason, pytrace=False)
+    pytest.skip(reason)
+
 
 @pytest.fixture(scope="session")
 def api():
@@ -48,14 +72,24 @@ def api():
     an explanation instead.
     """
     client = httpx.Client(base_url=API_BASE, timeout=120)
+
+    # The reason is captured here and acted on below, outside the except
+    # block: raising from inside it chains pytest's failure onto the
+    # ConnectError, so the report prints two tracebacks and buries the one
+    # line that says what to do about it.
+    unreachable: str | None = None
+    health = None
     try:
         health = client.get("/health")
     except httpx.HTTPError as exc:
-        client.close()
-        pytest.skip(
+        unreachable = (
             f"no backend at {API_BASE} ({exc.__class__.__name__}). Start it "
             f"(.claude/launch.json) and set LEXIMIND_API if it is not on port 8000."
         )
+
+    if unreachable is not None:
+        client.close()
+        _unavailable(unreachable)
 
     # Anything that is not this project's /health is a skip, not a failure —
     # including a 200 that isn't JSON at all. A Vite dev server answers every
@@ -69,7 +103,7 @@ def api():
         client.close()
         # Plain ASCII: this lands on a cp1252 console on Windows, where an em
         # dash comes out as a replacement character.
-        pytest.skip(
+        _unavailable(
             f"{API_BASE} is serving something else - /health has no models.classifier. "
             "This is probably another LexiMind build (the team repo also answers "
             "on :8000) or a frontend dev server; point LEXIMIND_API at this backend."

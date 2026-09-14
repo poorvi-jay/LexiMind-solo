@@ -1,0 +1,124 @@
+# LexiMind CI (M4 phase 3)
+#
+# The point of this job is that the integration tests actually EXECUTE.
+# backend/tests/conftest.py skips them when no backend answers, which is the
+# right default for a developer on a fresh clone and catastrophic here: a
+# plain `pytest` would report green having run only the unit tests.
+# LEXIMIND_REQUIRE_API=1 turns those skips into failures.
+name: CI
+
+on:
+  push:
+    branches: [main, "M*-dev"]
+  pull_request:
+    branches: [main]
+
+# A second push to the same branch makes the first run pointless — the model
+# downloads make these jobs slow enough that queueing them is a real cost.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      # No GROQ_API_KEY on purpose. Only /reading/simplify uses it, the Groq
+      # client is built lazily inside the request, and a missing key surfaces
+      # as a 503 that the suite asserts. Putting a real key here would spend a
+      # paid API call on every push to test one route that the phase-9 smoke
+      # test covers against the deployed app anyway.
+      DATABASE_URL: sqlite:///./ci.db
+      SECRET_KEY: ci-only-not-a-real-secret-do-not-reuse
+      LEXIMIND_API: http://127.0.0.1:8000
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          # poppler-utils  pdf2image shells out to it for /ocr/pdf. Without it
+          #                that route raises rather than degrades — the loud,
+          #                easy failure.
+          # default-jre    LanguageTool is a Java program. Without it
+          #                /nlp/check still returns spelling and homophones and
+          #                reports grammar_available: false, so F27 stops being
+          #                tested and NOTHING fails. The health gate below is
+          #                what catches that.
+          sudo apt-get install -y --no-install-recommends poppler-utils default-jre
+
+      - name: Cache model downloads
+        uses: actions/cache@v4
+        with:
+          # None of these ship in the repo; all four download on first use.
+          # Cold, they are ~700MB and dominate the job's runtime.
+          path: |
+            ~/.cache/language_tool_python
+            ~/.cache/huggingface
+            ~/.EasyOCR
+            ~/nltk_data
+          key: models-${{ runner.os }}-${{ hashFiles('backend/requirements.txt') }}
+          restore-keys: models-${{ runner.os }}-
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU torch first. easyocr pulls the default wheel, which bundles
+          # CUDA libraries nothing in this stack uses: 532MB against ~200MB.
+          # Installing it up front means the requirements resolve against the
+          # wheel already present.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r backend/requirements.txt
+
+      - name: Start the backend
+        run: |
+          python -m uvicorn backend.main:app --port 8000 > uvicorn.log 2>&1 &
+          echo $! > uvicorn.pid
+
+      - name: Wait for models, and assert they are usable
+        run: python scripts/ci_wait_for_health.py --url "$LEXIMIND_API"
+
+      - name: Test
+        env:
+          # The flag this whole job exists to set.
+          LEXIMIND_REQUIRE_API: "1"
+        # -rs prints the reason for every skip that remains. The flag above
+        # catches an absent backend; this catches a test that skips itself for
+        # some other reason and would otherwise vanish from the summary.
+        run: pytest backend/tests -q -rs
+
+      - name: Backend log
+        if: always()
+        run: cat uvicorn.log
+
+      - name: Stop the backend
+        if: always()
+        run: kill "$(cat uvicorn.pid)" || true
+
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm --prefix frontend ci
+      - run: npm --prefix frontend run lint
+      - run: npm --prefix frontend run build

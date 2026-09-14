@@ -20,9 +20,18 @@ DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DEFAULT_DB_PATH}")
 
 # check_same_thread=False: FastAPI serves requests from a thread pool, and a
 # SQLite connection is otherwise pinned to the thread that created it.
+#
+# timeout=30: pysqlite gives up after 5s by default and raises "database is
+# locked", which surfaces as a 500. One writer plus a thread pool of readers
+# makes that reachable on a deployed instance in a way it never was locally,
+# so wait for the lock instead of failing.
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
+    connect_args=(
+        {"check_same_thread": False, "timeout": 30}
+        if DATABASE_URL.startswith("sqlite")
+        else {}
+    ),
 )
 
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
@@ -31,11 +40,22 @@ Base = declarative_base()
 
 
 @event.listens_for(engine, "connect")
-def _enable_sqlite_foreign_keys(dbapi_connection, connection_record):
-    """SQLite ignores FK constraints unless enabled per-connection."""
+def _sqlite_pragmas(dbapi_connection, connection_record):
+    """Per-connection SQLite settings. Both are off by default.
+
+    foreign_keys  SQLite ignores FK constraints unless this is enabled.
+    journal_mode  The default rollback journal takes an exclusive lock for
+                  every write, so a read concurrent with a write blocks.
+                  WAL lets them overlap, which matters once more than one
+                  person is using a deployed instance. It is persistent —
+                  set on the file, not the connection — so re-running it is
+                  a no-op, and it creates the -wal and -shm sidecar files
+                  already covered by .gitignore.
+    """
     if DATABASE_URL.startswith("sqlite"):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
         cursor.close()
 
 
