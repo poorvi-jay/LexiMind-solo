@@ -57,8 +57,15 @@ jobs:
           #                what catches that.
           sudo apt-get install -y --no-install-recommends poppler-utils default-jre
 
-      - name: Cache model downloads
-        uses: actions/cache@v4
+      # Restore and save are split on purpose. A plain actions/cache saves in a
+      # post-job step that runs even when the job FAILED, so a run killed
+      # mid-download writes a partial cache — including huggingface_hub's .lock
+      # files — and every later run restores that and blocks on the lock
+      # forever. Saving only after a clean prefetch (see the save step at the
+      # end) means a poisoned cache can never be published.
+      - name: Restore model cache
+        id: model-cache
+        uses: actions/cache/restore@v4
         with:
           # None of these ship in the repo; all four download on first use.
           # Cold, they are ~700MB and dominate the job's runtime.
@@ -67,8 +74,9 @@ jobs:
             ~/.cache/huggingface
             ~/.EasyOCR
             ~/nltk_data
-          key: models-${{ runner.os }}-${{ hashFiles('backend/requirements.txt') }}
-          restore-keys: models-${{ runner.os }}-
+          # v2: v1 keys hold the partial cache from the runs that hung.
+          key: models-v2-${{ runner.os }}-${{ hashFiles('backend/requirements.txt') }}
+          restore-keys: models-v2-${{ runner.os }}-
 
       - name: Install Python dependencies
         run: |
@@ -80,13 +88,27 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r backend/requirements.txt
 
+      # Before uvicorn, not inside it. main.py warms the models on daemon
+      # threads, where a download failure becomes the single word
+      # "unavailable" on /health and a download HANG becomes "loading"
+      # forever — there is no timeout on the from_pretrained path. Here the
+      # same failure is a failed step with a traceback, and timeout-minutes
+      # bounds the hang instead of burning the health gate's whole window.
+      - name: Pre-download model weights
+        id: prefetch
+        timeout-minutes: 15
+        run: python scripts/prefetch_models.py
+
       - name: Start the backend
         run: |
           python -m uvicorn backend.main:app --port 8000 > uvicorn.log 2>&1 &
           echo $! > uvicorn.pid
 
+      # 240s rather than the default 600s: with the weights already on disk
+      # this is warm-up only, which measured ~50s locally. A long wait here
+      # now means something is wrong, not something is downloading.
       - name: Wait for models, and assert they are usable
-        run: python scripts/ci_wait_for_health.py --url "$LEXIMIND_API"
+        run: python scripts/ci_wait_for_health.py --url "$LEXIMIND_API" --timeout 240
 
       - name: Test
         env:
@@ -104,6 +126,21 @@ jobs:
       - name: Stop the backend
         if: always()
         run: kill "$(cat uvicorn.pid)" || true
+
+      # Keyed on the prefetch step, not on the job. A complete download is
+      # what makes a cache safe to publish; whether the tests then passed is
+      # unrelated. Skipped on an exact key hit, since that cache already
+      # exists and re-uploading ~700MB would achieve nothing.
+      - name: Save model cache
+        if: always() && steps.prefetch.outcome == 'success' && steps.model-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/language_tool_python
+            ~/.cache/huggingface
+            ~/.EasyOCR
+            ~/nltk_data
+          key: models-v2-${{ runner.os }}-${{ hashFiles('backend/requirements.txt') }}
 
   frontend:
     name: Frontend build
