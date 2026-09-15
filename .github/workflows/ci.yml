@@ -111,7 +111,10 @@ jobs:
       - name: Pre-download model weights
         id: prefetch
         timeout-minutes: 15
-        run: python scripts/prefetch_models.py
+        # easyocr included since phase 4: test_media_routes.py exercises
+        # /ocr/image, and without this the ~100MB of detection and
+        # recognition weights would download inside the first test instead.
+        run: python scripts/prefetch_models.py --only transformers nltk easyocr
 
       - name: Start the backend
         run: |
