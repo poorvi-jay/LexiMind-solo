@@ -35,6 +35,7 @@ import os
 import shutil
 import sys
 import time
+import traceback
 from pathlib import Path
 
 # Progress bars render as thousands of lines in a CI log.
@@ -84,6 +85,16 @@ def attempt(label: str, fn, retries: int = 3, backoff: float = 5.0) -> bool:
             print(f"  {label}: attempt {i}/{retries} failed: "
                   f"{type(exc).__name__}: {exc}", flush=True)
             if i == retries:
+                # Only on the last attempt, and only then: transformers wraps
+                # a failed backend import as "Could not import module 'X'.
+                # Are this object's requirements defined correctly?", which
+                # names the model class and hides the actual ImportError.
+                # The chain is where the real cause lives.
+                traceback.print_exc()
+                cause = exc.__cause__ or exc.__context__
+                while cause is not None:
+                    print(f"  caused by: {type(cause).__name__}: {cause}", flush=True)
+                    cause = cause.__cause__ or cause.__context__
                 return False
             time.sleep(backoff * i)
         else:
@@ -93,6 +104,14 @@ def attempt(label: str, fn, retries: int = 3, backoff: float = 5.0) -> bool:
 
 
 def fetch_transformers() -> None:
+    # torch first, and on its own line. transformers resolves model classes
+    # lazily, so a broken torch surfaces as a ModuleNotFoundError naming
+    # GPT2LMHeadModel — which reads like a missing model rather than a
+    # missing backend and sends you looking in the wrong place entirely.
+    import torch
+
+    print(f"    torch {torch.__version__} (cuda={torch.cuda.is_available()})", flush=True)
+
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     AutoTokenizer.from_pretrained(MODEL_NAME)

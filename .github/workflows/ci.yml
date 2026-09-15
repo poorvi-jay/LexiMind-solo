@@ -81,12 +81,26 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          # CPU torch first. easyocr pulls the default wheel, which bundles
-          # CUDA libraries nothing in this stack uses: 532MB against ~200MB.
-          # Installing it up front means the requirements resolve against the
-          # wheel already present.
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # Deliberately a plain install of the pinned requirements — the same
+          # path that is known to work on a developer machine.
+          #
+          # A "pip install torch --index-url .../whl/cpu" first would save
+          # ~330MB (easyocr pulls the default wheel, which bundles CUDA
+          # libraries nothing here uses), and that is worth having. But it was
+          # also the only thing CI did that local development does not, and it
+          # broke transformers' torch backend: from_pretrained failed with
+          # "Could not import module 'GPT2LMHeadModel'". Get the baseline
+          # green first, then reintroduce the saving on its own commit where
+          # a regression is attributable. M4 phase 7 needs it for the image.
           pip install -r backend/requirements.txt
+
+      - name: Environment report
+        run: |
+          # Printed unconditionally so a future failure has the versions
+          # beside it in the same log, rather than needing a re-run to learn
+          # what was installed.
+          python -c "import sys; print('python', sys.version)"
+          pip list 2>/dev/null | grep -iE '^(torch|torchvision|transformers|numpy|easyocr|spacy) ' || true
 
       # Before uvicorn, not inside it. main.py warms the models on daemon
       # threads, where a download failure becomes the single word
@@ -119,13 +133,20 @@ jobs:
         # some other reason and would otherwise vanish from the summary.
         run: pytest backend/tests -q -rs
 
+      # Guarded: the prefetch step runs before uvicorn, so a failure there
+      # leaves no log and no pid. An unguarded `cat` then fails too, adding a
+      # second red step that has nothing to do with the real fault.
       - name: Backend log
         if: always()
-        run: cat uvicorn.log
+        run: |
+          if [ -f uvicorn.log ]; then cat uvicorn.log; else
+            echo "no uvicorn.log — the job failed before the backend started"
+          fi
 
       - name: Stop the backend
         if: always()
-        run: kill "$(cat uvicorn.pid)" || true
+        run: |
+          if [ -f uvicorn.pid ]; then kill "$(cat uvicorn.pid)" 2>/dev/null || true; fi
 
       # Keyed on the prefetch step, not on the job. A complete download is
       # what makes a cache safe to publish; whether the tests then passed is
