@@ -1,7 +1,6 @@
-import PropTypes from 'prop-types'
 import { useMemo } from 'react'
 
-export default function ReadingProgress({ activeIndex, totalWords, durationMs }) {
+export default function ReadingProgress({ activeIndex, totalWords, durationMs = 0 }) {
   const progress = useMemo(() => {
     if (totalWords <= 0 || activeIndex < 0) return 0
     return Math.min(100, Math.round(((activeIndex + 1) / totalWords) * 100))
@@ -53,12 +52,3 @@ export default function ReadingProgress({ activeIndex, totalWords, durationMs })
   )
 }
 
-ReadingProgress.propTypes = {
-  activeIndex: PropTypes.number.isRequired,
-  totalWords: PropTypes.number.isRequired,
-  durationMs: PropTypes.number,
-}
-
-ReadingProgress.defaultProps = {
-  durationMs: 0,
-}
