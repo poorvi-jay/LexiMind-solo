@@ -98,6 +98,24 @@ def test_syllabify_returns_parts_per_word(reader):
     )
 
 
+def test_pyphen_is_installed_rather_than_silently_replaced():
+    """No server needed: this guards the environment, not the route.
+
+    syllables._hyphenator() returns None when pyphen cannot be imported, and
+    split_syllables() then falls back to NLTK without any error. The route
+    tests above still pass on the fallback - the parts still reassemble - so
+    a missing dependency would ship as quietly different syllable breaks.
+    pyphen was once installed by hand and absent from requirements.txt, which
+    is exactly how that happens.
+    """
+    from backend.services.syllables import _hyphenator
+
+    assert _hyphenator() is not None, (
+        "pyphen is not importable, so syllables are coming from the NLTK "
+        "fallback - add it to backend/requirements.txt"
+    )
+
+
 def test_syllabify_shares_the_batch_ceiling_with_classify(reader):
     assert reader("/reading/syllabify", {"words": ["cat"] * 5000}).status_code == 200
     assert reader("/reading/syllabify", {"words": ["cat"] * 5001}).status_code == 422

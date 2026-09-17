@@ -47,6 +47,10 @@ numpy==2.4.6
 edge-tts==7.2.8
 groq==1.6.0                     # needs GROQ_API_KEY in backend/.env
 httpx==0.28.1                   # dictionary lookups in routers/reading.py
+pyphen==0.18.1                  # syllable splits for /reading/syllabify. Without
+                                # it syllables.py silently falls back to NLTK's
+                                # tokenizer and splits words differently; nothing
+                                # else depends on it, so it must be listed here.
 
 # ── NLP writing checks (M2 phase 4) ───────────────────────────────────────
 nltk==3.9.4                     # cmudict syllable counts
