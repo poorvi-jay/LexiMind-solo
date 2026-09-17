@@ -180,3 +180,72 @@ def letters(count: int, prefix: str = "zz") -> list[str]:
     edges, so "word01".."word25" would collapse to a single "word".
     """
     return [f"{prefix}{chr(97 + i)}{chr(97 + i)}" for i in range(count)]
+
+
+def sample_png(width: int = 480, height: int = 120, text: str = "HELLO") -> bytes:
+    """A white PNG with black text, built with the OpenCV already in requirements.
+
+    Generated rather than committed: a checked-in binary is two kilobytes
+    nobody can review in a diff, and this is a few readable lines.
+    """
+    import cv2
+    import numpy as np
+
+    canvas = np.full((height, width, 3), 255, dtype=np.uint8)
+    cv2.putText(canvas, text, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 0), 4)
+    ok, buffer = cv2.imencode(".png", canvas)
+    assert ok, "could not encode the test PNG"
+    return buffer.tobytes()
+
+
+def blank_png() -> bytes:
+    import cv2
+    import numpy as np
+
+    ok, buffer = cv2.imencode(".png", np.full((80, 200, 3), 255, dtype=np.uint8))
+    assert ok
+    return buffer.tobytes()
+
+
+def sample_pdf(text: str = "Hello LexiMind") -> bytes:
+    """A minimal single-page PDF carrying a real text layer.
+
+    Written out longhand because the xref table stores the byte offset of every
+    object, so this cannot be a static string with the text substituted in —
+    changing the text moves everything after it.
+
+    The text layer is the point: ocr_service reads it with pdfplumber and only
+    falls back to rendering pages through poppler when there is nothing to
+    read, so this exercises the fast path.
+    """
+    objects = [
+        b"<</Type/Catalog/Pages 2 0 R>>",
+        b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
+        b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]"
+        b"/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>",
+        None,  # the content stream, built below
+        b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
+    ]
+    stream = f"BT /F1 24 Tf 72 700 Td ({text}) Tj ET".encode("ascii")
+    objects[3] = (
+        b"<</Length " + str(len(stream)).encode() + b">>stream\n" + stream + b"\nendstream"
+    )
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        # The newlines are load-bearing. Without one before `endobj` the stream
+        # object reads as "endstreamendobj" and pdfminer rejects the file.
+        out += f"{number} 0 obj\n".encode() + body + b"\nendobj\n"
+
+    xref_at = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode()
+    out += b"0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode()
+    out += (
+        f"trailer<</Size {len(objects) + 1}/Root 1 0 R>>\n"
+        f"startxref\n{xref_at}\n%%EOF\n"
+    ).encode()
+    return bytes(out)
