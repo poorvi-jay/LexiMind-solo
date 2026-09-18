@@ -43,7 +43,9 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 MODEL_NAME = "distilgpt2"          # keep in step with prediction_service
-NLTK_PACKAGES = ["cmudict", "wordnet", "omw-1.4"]
+# Every nltk.download() the backend makes: cmudict (syllables.py), wordnet and
+# omw-1.4 (routers/reading.py), words (nlp_service.py's spelling vocabulary).
+NLTK_PACKAGES = ["cmudict", "wordnet", "omw-1.4", "words"]
 
 
 def clear_stale_locks() -> int:
@@ -53,7 +55,12 @@ def clear_stale_locks() -> int:
     and nothing else runs here.
     """
     removed = 0
-    for root in (Path.home() / ".cache" / "huggingface", Path.home() / ".cache" / "hub"):
+    roots = [Path.home() / ".cache" / "huggingface", Path.home() / ".cache" / "hub"]
+    # The container moves the cache with HF_HOME; sweeping only the default
+    # location there would clear nothing and still hang on the real lock.
+    if os.environ.get("HF_HOME"):
+        roots.insert(0, Path(os.environ["HF_HOME"]))
+    for root in roots:
         if not root.exists():
             continue
         for lock in root.rglob("*.lock"):
@@ -134,10 +141,25 @@ def fetch_easyocr() -> None:
     easyocr.Reader(["en"], gpu=False, verbose=False)
 
 
+def fetch_languagetool() -> None:
+    import language_tool_python
+
+    # Constructing it downloads the LanguageTool server (~259MB) into
+    # LTP_PATH or ~/.cache/language_tool_python, then starts a JVM on a
+    # local port. Closing it matters in a build: a stray JVM would outlive
+    # this step and hold the layer open.
+    tool = language_tool_python.LanguageTool("en-US")
+    try:
+        assert tool.check("This are wrong."), "LanguageTool started but found nothing"
+    finally:
+        tool.close()
+
+
 TARGETS = {
     "transformers": (fetch_transformers, f"{MODEL_NAME} (~350MB) for F29 prediction"),
     "nltk": (fetch_nltk, "cmudict syllables, WordNet definition fallback"),
     "easyocr": (fetch_easyocr, "detection + recognition weights (~100MB) for F05"),
+    "languagetool": (fetch_languagetool, "LanguageTool server (~259MB) for F27 grammar; needs Java"),
 }
 
 
@@ -147,8 +169,8 @@ def main() -> int:
         "--only",
         nargs="*",
         choices=sorted(TARGETS),
-        help="Subset to fetch. Default: transformers and nltk. EasyOCR is "
-        "opt-in because nothing tests /ocr/image until M4 phase 4.",
+        help="Subset to fetch. Default: transformers and nltk. The container "
+        "build fetches all four; CI leaves languagetool to its own cache.",
     )
     parser.add_argument(
         "--keep-locks",

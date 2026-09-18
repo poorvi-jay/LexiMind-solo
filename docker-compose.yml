@@ -1,0 +1,38 @@
+# Run the API image locally, the way it will run deployed.
+#
+#   docker compose up --build
+#   python scripts/ci_wait_for_health.py --url http://127.0.0.1:8002
+#
+# Port 8002 on purpose: the development server uses 8000 or 8001 (see
+# .claude/launch.json), and the team repo's server often holds 8000.
+
+services:
+  api:
+    build: .
+    image: leximind-api
+    ports:
+      - "8002:8000"
+    # Your local secrets, if present. Optional so a fresh clone can still
+    # start the container; without GROQ_API_KEY, /reading/simplify answers 503
+    # and everything else works.
+    env_file:
+      - path: backend/.env
+        required: false
+    environment:
+      # Overrides whatever backend/.env says: inside the container the
+      # database must be on the volume, whatever the host-side path was.
+      DATABASE_URL: sqlite:////data/leximind.db
+      # The dev frontend, so the local pair can talk to this container.
+      CORS_ORIGINS: http://localhost:5173,http://localhost:5174
+      # backend/.env sets a Windows JAVA_HOME for the dev machine. It would be
+      # ignored here anyway (java is on PATH in the image, and nlp_service only
+      # consults JAVA_HOME when it is not), but a Windows path in a Linux
+      # container's environment is a red herring for whoever debugs it next.
+      JAVA_HOME: ""
+    volumes:
+      # A named volume, not a bind mount, mirrors a platform disk: it outlives
+      # the container. `docker compose down` keeps it; `down -v` deletes it.
+      - leximind-data:/data
+
+volumes:
+  leximind-data:

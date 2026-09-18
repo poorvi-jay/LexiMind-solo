@@ -1,0 +1,34 @@
+# Keep the build context to what the API image actually copies. Anything
+# listed here is never sent to the Docker daemon, which matters twice over:
+# the context uploads faster, and a secret that is not sent cannot be baked in.
+
+# Secrets. backend/.env holds GROQ_API_KEY and SECRET_KEY; they belong in the
+# host's environment, never in an image layer.
+**/.env
+**/.env.*
+
+# Local state. The database lives on the mounted volume, not in the image.
+**/*.db
+**/*.db-journal
+**/*.db-wal
+**/*.db-shm
+
+# Environments and caches, rebuilt inside the image.
+backend/venv
+**/.venv
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+
+# Not part of the API image.
+frontend
+backend/tests
+backend/ml/data
+.git
+.github
+.claude
+**/node_modules
+**/dist
+
+# The stale root requirements.txt must never be what an install reads.
+requirements.txt
