@@ -86,8 +86,23 @@ jobs:
       - name: No secrets baked in
         run: |
           # .dockerignore excludes them; this proves it, rather than trusting it.
-          found=$(docker run --rm "$IMAGE" sh -c 'find / -name ".env" -not -path "/proc/*" 2>/dev/null')
-          [ -z "$found" ] || { echo "::error::.env found in image: $found"; exit 1; }
+          #
+          # The `|| true` is load-bearing. This step runs under `bash -e`, and
+          # find exits 1 whenever it could not read a directory — which it
+          # cannot, running as the unprivileged `app` user across /root and
+          # parts of /var. Sending those messages to /dev/null hides the noise
+          # but not the exit status, so without this the step fails before it
+          # has printed either its verdict or its error.
+          #
+          # -xdev keeps it on the image's own filesystem rather than walking
+          # /proc and /sys.
+          found=$(docker run --rm "$IMAGE" sh -c \
+            'find / -xdev \( -name ".env" -o -name ".env.*" \) 2>/dev/null || true')
+
+          if [ -n "$found" ]; then
+            echo "::error::secrets baked into the image: $found"
+            exit 1
+          fi
           echo "no .env files in the image"
 
       - name: Weights load with the network off
