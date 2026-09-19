@@ -73,9 +73,17 @@ RUN pip install \
 # and the weights are owned by it from the start. Downloading as root and then
 # `chown -R`-ing would copy every file into a new layer and roughly double the
 # image.
+# Each cache directory is created explicitly, not left to the library. NLTK in
+# particular skips any entry of NLTK_DATA that does not already exist and
+# silently downloads to ~/nltk_data instead, which then works by accident
+# until something changes HOME.
 RUN useradd --create-home --uid 10001 app \
-    && mkdir -p /opt/models /data \
-    && chown app:app /opt/models /data
+    && mkdir -p /opt/models/huggingface \
+                /opt/models/nltk_data \
+                /opt/models/easyocr \
+                /opt/models/language_tool_python \
+                /data \
+    && chown -R app:app /opt/models /data
 
 USER app
 

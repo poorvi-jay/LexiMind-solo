@@ -43,9 +43,15 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 MODEL_NAME = "distilgpt2"          # keep in step with prediction_service
-# Every nltk.download() the backend makes: cmudict (syllables.py), wordnet and
-# omw-1.4 (routers/reading.py), words (nlp_service.py's spelling vocabulary).
-NLTK_PACKAGES = ["cmudict", "wordnet", "omw-1.4", "words"]
+# Every nltk.download() the backend makes, mapped to the resource path that
+# proves it is usable: cmudict (syllables.py), wordnet and omw-1.4
+# (routers/reading.py), words (nlp_service.py's spelling vocabulary).
+NLTK_PACKAGES = {
+    "cmudict": "corpora/cmudict",
+    "wordnet": "corpora/wordnet",
+    "omw-1.4": "corpora/omw-1.4",
+    "words": "corpora/words",
+}
 
 
 def clear_stale_locks() -> int:
@@ -126,11 +132,55 @@ def fetch_transformers() -> None:
 
 
 def fetch_nltk() -> None:
+    """Download each corpus AND prove it can be loaded afterwards.
+
+    Two failures this guards against, both seen in the container build:
+
+    1. NLTK_DATA pointing at a directory that does not exist yet.
+       Downloader.default_download_dir() skips any path that is missing, so
+       the download silently lands in ~/nltk_data instead — which works by
+       luck until something changes the home directory.
+
+    2. A corpus that downloads but does not resolve. wordnet ships as a zip,
+       and when it is not unpacked nltk.data.find() raises LookupError at the
+       first definition lookup — in production, not here. A successful
+       download() return is not evidence the corpus is usable, so each one is
+       loaded before this function claims success.
+    """
     import nltk
 
-    for package in NLTK_PACKAGES:
+    target = os.environ.get("NLTK_DATA")
+    if target:
+        Path(target).mkdir(parents=True, exist_ok=True)
+        if target not in nltk.data.path:
+            nltk.data.path.insert(0, target)
+
+    for package, resource in NLTK_PACKAGES.items():
         # raise_on_error so a silent False return can't look like success.
-        nltk.download(package, quiet=True, raise_on_error=True)
+        nltk.download(package, quiet=True, raise_on_error=True, download_dir=target)
+
+        try:
+            nltk.data.find(resource)
+        except LookupError:
+            _unzip_corpus(package, target)
+            # Let this one propagate: a corpus that still will not load after
+            # being unpacked is a broken build, not something to paper over.
+            nltk.data.find(resource)
+
+
+def _unzip_corpus(package: str, target: str | None) -> None:
+    """Unpack <package>.zip in place, for corpora NLTK left archived."""
+    import zipfile
+
+    import nltk
+
+    for root in filter(None, [target, *nltk.data.path]):
+        archive = Path(root) / "corpora" / f"{package}.zip"
+        if archive.exists():
+            print(f"    unpacking {archive}", flush=True)
+            with zipfile.ZipFile(archive) as zf:
+                zf.extractall(archive.parent)
+            return
 
 
 def fetch_easyocr() -> None:
